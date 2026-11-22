@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubeheal-agent
+  namespace: kubeheal-system
+  labels:
+    app: kubeheal-agent
+spec:
+  type: ClusterIP
+  selector:
+    app: kubeheal-agent
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

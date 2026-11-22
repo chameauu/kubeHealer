@@ -1,0 +1,38 @@
+Phoenix — Chaos Engineering & Self-Healing Agent
+================================================
+
+Original design and architecture by Kaushikkumaran
+GitHub: https://github.com/CodeBuildder/phoenix
+First committed: June 2026
+
+This project represents original work including:
+- A synthetic infrastructure provisioning simulator (enterprise cloud-style volume/VLAN/
+  instance operations) that is intentionally faultable
+- A chaos-injection engine unifying Chaos Mesh faults and simulator faults behind one
+  control surface
+- An AI agent design for autonomous failure detection, diagnosis, healing, and
+  human-in-the-loop approval (LangGraph detect -> diagnose -> heal -> approve -> verify)
+- Blast-radius prediction, failure-mode taxonomy classification, and predictive-healing
+  with confidence scoring
+- A SOC/NOC-themed real-time resilience console UI design
+
+All architectural decisions are documented in [`sentinel-platform/docs`](https://github.com/CodeBuildder/sentinel-platform/tree/main/docs).
+Commit history on GitHub serves as timestamped proof of authorship.
+
+This notice must be retained in all copies and derivative works.
+
+==============================================================================
+
+KubeHeal — attribution notice
+==============================================================================
+
+Portions of KubeHeal's architecture, service boundaries and interface contracts are
+derived from Phoenix (https://github.com/CodeBuildder/phoenix), Copyright
+Kaushikkumaran, licensed under Apache-2.0 (see LICENSE). Those portions remain under
+the attribution above.
+
+KubeHeal-specific work: renamed services and identifiers, corrected contracts, a
+checkpointed approval pipeline, and new documentation. The diagnosis prompt, fault
+catalogue text and demo topology fixture were authored for this project.
+
+KubeHeal is distributed under the Apache License, Version 2.0.

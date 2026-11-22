@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubeheal-sim
+  namespace: kubeheal-system
+  labels:
+    app: kubeheal-sim
+    app.kubernetes.io/part-of: kubeheal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubeheal-sim
+  template:
+    metadata:
+      labels:
+        app: kubeheal-sim
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: sim
+          image: kubeheal-sim:latest
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: LOG_LEVEL
+              value: INFO
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }

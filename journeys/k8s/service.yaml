@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubeheal-journeys
+  namespace: kubeheal-system
+  labels:
+    app: kubeheal-journeys
+spec:
+  type: ClusterIP
+  selector:
+    app: kubeheal-journeys
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
