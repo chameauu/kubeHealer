@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
 from events import configure_logging, log_event
+from routers.library import router as library_router
 
 
 @asynccontextmanager
@@ -24,6 +25,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+app.include_router(library_router)
 
 
 @app.get("/health")
