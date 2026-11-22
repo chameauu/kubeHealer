@@ -355,6 +355,8 @@ class ScenarioEngine:
                 )
                 return scenario
             scenario.live_status = summarize_status(resource.get("status"))
+            if _reports_recovery(scenario.live_status):
+                await self._delete_recovered(scenario)
         else:
             try:
                 rule = await self._simulator.get_fault(scenario.backend_ref)
@@ -373,6 +375,28 @@ class ScenarioEngine:
 
         await self._store.save(scenario)
         return scenario
+
+    async def _delete_recovered(self, scenario: Scenario) -> None:
+        """Remove a CR that reports recovery but is still in the cluster.
+
+        Chaos Mesh marks a finished experiment `AllRecovered` and then leaves
+        the object behind; completion is only deduced from absence, so nothing
+        would ever look again. Deleting it here is best-effort: the scenario
+        stays running and the next sweep concludes through the existing path.
+        """
+        try:
+            await self._chaos_mesh.delete(
+                scenario.fault_type,
+                scenario.backend_ref,
+                _namespace(scenario),
+            )
+        except Exception as exc:
+            log.warning(
+                "chaos_mesh_recovered_delete_failed",
+                scenario_id=scenario.id,
+                backend_ref=scenario.backend_ref,
+                error=str(exc),
+            )
 
     async def _mark_completed(self, scenario: Scenario, *, reason: str) -> None:
         scenario.touch_status(ScenarioStatus.COMPLETED)
@@ -422,6 +446,21 @@ def _as_dict(target: Any) -> dict[str, Any]:
     if isinstance(target, dict):
         return dict(target)
     return target.model_dump()
+
+
+def _reports_recovery(status: dict[str, Any] | None) -> bool:
+    """True when Chaos Mesh says the experiment has fully recovered.
+
+    The CR stays in the cluster until it is deleted, so a truthful
+    `AllRecovered: True` is the signal to remove it and let the next sweep
+    deduce completion from absence.
+    """
+    if not status:
+        return False
+    return any(
+        condition.get("type") == "AllRecovered" and condition.get("status") == "True"
+        for condition in status.get("conditions") or []
+    )
 
 
 def _namespace(scenario: Scenario) -> str:

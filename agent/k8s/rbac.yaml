@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubeheal-agent
+  namespace: kubeheal-system
+  labels:
+    app: kubeheal-agent
+    app.kubernetes.io/part-of: kubeheal
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubeheal-agent
+  namespace: kubeheal-system
+  labels:
+    app: kubeheal-agent
+    app.kubernetes.io/part-of: kubeheal
+rules:
+  # The approved write path: a pod-template patch rolls a Deployment, a scale
+  # patch changes its replica count. Nothing else is allowed to mutate.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "patch"]
+  # Evidence only: verification reads the pods the fix touched.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubeheal-agent
+  namespace: kubeheal-system
+  labels:
+    app: kubeheal-agent
+    app.kubernetes.io/part-of: kubeheal
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubeheal-agent
+subjects:
+  - kind: ServiceAccount
+    name: kubeheal-agent
+    namespace: kubeheal-system

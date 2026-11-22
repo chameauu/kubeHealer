@@ -20,6 +20,9 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
+        # The PVC is created root-owned; the group ownership lets uid 1000 write
+        # the SQLite database and its WAL files without a privileged init step.
+        fsGroup: 1000
       containers:
         - name: chaos
           image: kubeheal-chaos:latest
@@ -32,11 +35,13 @@ spec:
               value: INFO
             - name: SIMULATOR_URL
               value: http://kubeheal-sim.kubeheal-system.svc.cluster.local
-            # Persistence is a PVC once the cluster gate lands; until then the
-            # document store lives on the container filesystem and is lost on
-            # reschedule, which the restart reconciliation tolerates.
+            # The document store lives on a PVC, so scenarios and their
+            # transitions survive a pod reschedule or a restart.
             - name: CHAOS_DB_PATH
               value: /app/data/chaos.db
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
           livenessProbe:
             httpGet: { path: /health, port: http }
             initialDelaySeconds: 5
@@ -48,3 +53,7 @@ spec:
           resources:
             requests: { cpu: 100m, memory: 128Mi }
             limits: { cpu: 500m, memory: 512Mi }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: kubeheal-chaos-data

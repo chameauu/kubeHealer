@@ -16,9 +16,14 @@ spec:
       labels:
         app: kubeheal-agent
     spec:
+      # The write path patches Deployments; RBAC for this identity is in rbac.yaml.
+      serviceAccountName: kubeheal-agent
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
+        # Incident memory and the LangGraph checkpoints both live on the PVC, so
+        # a pending approval survives a pod restart and can still be resumed.
+        fsGroup: 1000
       containers:
         - name: agent
           image: kubeheal-agent:latest
@@ -29,6 +34,28 @@ spec:
           env:
             - name: LOG_LEVEL
               value: INFO
+            - name: AGENT_DB_PATH
+              value: /data/memory.db
+            - name: AGENT_CHECKPOINT_PATH
+              value: /data/checkpoints.db
+            # The authored cassette ships inside the image; the path is relative
+            # to the working directory, /app.
+            - name: AGENT_CASSETTE_PATH
+              value: fixtures/diagnosis-cassette.json
+            # LLM_MODE=stub needs no key. LLM_MODE=cassette replays the authored
+            # cassette offline. LLM_MODE=openai requires the OPENAI_API_KEY
+            # secret, which is never committed to the repository.
+            - name: LLM_MODE
+              value: stub
+            - name: GRAPH_URL
+              value: http://kubeheal-graph.kubeheal-system.svc.cluster.local
+            - name: FAULTLIB_URL
+              value: http://kubeheal-faultlib.kubeheal-system.svc.cluster.local
+            - name: CHAOS_URL
+              value: http://kubeheal-chaos.kubeheal-system.svc.cluster.local
+          volumeMounts:
+            - name: data
+              mountPath: /data
           livenessProbe:
             httpGet: { path: /health, port: http }
             initialDelaySeconds: 5
@@ -40,3 +67,7 @@ spec:
           resources:
             requests: { cpu: 100m, memory: 128Mi }
             limits: { cpu: 500m, memory: 512Mi }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: kubeheal-agent-data

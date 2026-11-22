@@ -192,6 +192,89 @@ def test_memory_payload_shape(client: Any, monkeypatch: Any) -> None:
     assert body["confidence"] == 100
 
 
+def _finished_run(
+    scenario_id: str,
+    verify_result: Any,
+    *,
+    status: str = "done",
+    node: str = "report",
+) -> dict[str, Any]:
+    """A run the graph closed at `report`, with `status` as the store wrote it."""
+    return _run(
+        scenario_id,
+        status=status,
+        node=node,
+        verify_result=verify_result,
+        approval_status="approved",
+    )
+
+
+def test_get_failed_verification_is_error_not_done(
+    client: Any, monkeypatch: Any
+) -> None:
+    failed = _finished_run("sc-failed", "failed: deadline reached while running")
+    _install(monkeypatch, FakeStore([failed]), FakeGraph())
+
+    response = client.get("/runs/sc-failed")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "error"
+
+
+def test_get_recovered_verification_is_still_done(
+    client: Any, monkeypatch: Any
+) -> None:
+    recovered = _finished_run("sc-ok", "recovered")
+    _install(monkeypatch, FakeStore([recovered]), FakeGraph())
+
+    response = client.get("/runs/sc-ok")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "done"
+
+
+def test_get_dict_verification_failure_is_error(
+    client: Any, monkeypatch: Any
+) -> None:
+    failed = _finished_run("sc-dict", {"status": "failed", "reason": "timeout"})
+    _install(monkeypatch, FakeStore([failed]), FakeGraph())
+
+    response = client.get("/runs/sc-dict")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "error"
+
+
+def test_list_agrees_with_detail_on_failed_verification(
+    client: Any, monkeypatch: Any
+) -> None:
+    failed = _finished_run("sc-failed", "failed: scenario unreadable")
+    recovered = _finished_run("sc-ok", "recovered")
+    _install(monkeypatch, FakeStore([failed, recovered]), FakeGraph())
+
+    body = client.get("/runs").json()
+
+    statuses = {run["scenario_id"]: run["status"] for run in body["runs"]}
+    assert statuses == {"sc-failed": "error", "sc-ok": "done"}
+
+
+def test_aborted_beats_a_failed_verification(
+    client: Any, monkeypatch: Any
+) -> None:
+    aborted = _finished_run(
+        "sc-aborted",
+        "failed: approval rejected",
+        status="running",
+        node="aborted",
+    )
+    _install(monkeypatch, FakeStore([aborted]), FakeGraph())
+
+    response = client.get("/runs/sc-aborted")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "aborted"
+
+
 def test_router_reads_the_globals_per_request(client: Any, monkeypatch: Any) -> None:
     first = FakeStore([_run("sc-a")])
     second = FakeStore([_run("sc-b")])
@@ -207,3 +290,19 @@ def test_router_reads_the_globals_per_request(client: Any, monkeypatch: Any) -> 
     assert [run["scenario_id"] for run in response_b.json()["runs"]] == ["sc-b"]
     assert first.list_calls == 1
     assert second.list_calls == 1
+
+
+def test_pending_approval_is_awaiting_approval_even_before_the_approve_node_runs(
+    client: Any, monkeypatch: Any
+) -> None:
+    # The interrupt fires between `heal_plan` and `execute`, so the projection
+    # still carries the node that just finished. Deriving from `node` alone
+    # reported `running` while the run was parked at the gate.
+    at_gate = _run("sc-gate", status="running", node="heal_plan")
+    _install(monkeypatch, FakeStore([at_gate]), FakeGraph())
+
+    detail = client.get("/runs/sc-gate")
+    listing = client.get("/runs")
+
+    assert detail.json()["status"] == "awaiting_approval"
+    assert listing.json()["runs"][0]["status"] == "awaiting_approval"

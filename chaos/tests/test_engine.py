@@ -417,6 +417,84 @@ async def test_sweeper_never_queries_a_non_running_scenario(
         await engine.stop_sweeper()
 
 
+async def test_recovered_cr_is_deleted_but_scenario_stays_running(
+    engine: Any, fake_chaos_mesh: Any
+) -> None:
+    scenario = await engine.start(_request())
+    fake_chaos_mesh.recover(NAMESPACE, scenario.backend_ref)
+
+    await engine.get(scenario.id, refresh=True)
+
+    assert fake_chaos_mesh.delete_calls == [
+        ("pod_kill", scenario.backend_ref, NAMESPACE)
+    ]
+    stored = await engine.get(scenario.id, refresh=False)
+    assert stored.status == "running"
+
+
+async def test_completion_follows_the_deleted_recovered_cr(
+    engine: Any, fake_chaos_mesh: Any, events: list[dict[str, Any]]
+) -> None:
+    scenario = await engine.start(_request())
+    fake_chaos_mesh.recover(NAMESPACE, scenario.backend_ref)
+    await engine.get(scenario.id, refresh=True)
+
+    refreshed = await engine.get(scenario.id, refresh=True)
+
+    assert refreshed.status == "completed"
+    assert refreshed.ended_at is not None
+    assert COMPLETED in _event_types(events)
+
+
+async def test_injected_cr_is_never_deleted(
+    engine: Any, fake_chaos_mesh: Any
+) -> None:
+    scenario = await engine.start(_request())
+
+    refreshed = await engine.get(scenario.id, refresh=True)
+
+    assert refreshed.status == "running"
+    assert fake_chaos_mesh.delete_calls == []
+
+
+async def test_failed_recovery_delete_is_swallowed_and_logged(
+    make_engine: Any,
+) -> None:
+    from structlog.testing import capture_logs
+
+    failing = FailingDeleteChaosMeshClient()
+    engine = make_engine(chaos_mesh=failing)
+    scenario = await engine.start(_request())
+    failing.recover(NAMESPACE, scenario.backend_ref)
+
+    with capture_logs() as logs:
+        refreshed = await engine.get(scenario.id, refresh=True)
+
+    assert refreshed.status == "running"
+    assert failing.delete_calls == [("pod_kill", scenario.backend_ref, NAMESPACE)]
+    assert any(
+        entry["event"] == "chaos_mesh_recovered_delete_failed"
+        and entry["scenario_id"] == scenario.id
+        for entry in logs
+    ), logs
+
+
+async def test_sweeper_deletes_a_recovered_cr_then_completes(
+    engine: Any, fake_chaos_mesh: Any, events: list[dict[str, Any]]
+) -> None:
+    scenario = await engine.start(_request())
+    fake_chaos_mesh.recover(NAMESPACE, scenario.backend_ref)
+
+    await engine.start_sweeper()
+    try:
+        await asyncio.sleep(0.3)
+        swept = await engine.get(scenario.id, refresh=False)
+        assert swept.status == "completed"
+        assert COMPLETED in _event_types(events)
+    finally:
+        await engine.stop_sweeper()
+
+
 async def test_duration_never_completes_a_live_backend(
     engine: Any, fake_chaos_mesh: Any
 ) -> None:

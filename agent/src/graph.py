@@ -52,12 +52,25 @@ class NotPending(Exception):
     """
 
 
-def stub_diagnosis(**_context: Any) -> dict[str, Any]:
-    """Deterministic diagnosis used by tests and by the offline demo."""
+def stub_diagnosis(**context: Any) -> dict[str, Any]:
+    """Deterministic diagnosis used by tests and by the offline demo.
+
+    The action targets the workload the scenario actually faulted, when the
+    scenario carries one: a fixed name could never be right in a real cluster,
+    and a remediation aimed at a deployment that does not exist fails for a
+    reason that says nothing about the system. The demo string is the fallback
+    for callers that pass no scenario (the unit tests do).
+    """
+    scenario = context.get("scenario") or {}
+    target = scenario.get("target") or {}
+    namespace = target.get("namespace")
+    labels = target.get("label_selector") or {}
+    name = labels.get("app") or labels.get("k8s-app")
+    action_target = f"{namespace}/{name}" if namespace and name else "edge/api"
     return {
         "causal_chain": ["pod terminated", "deployment unavailable", "downstream 503s"],
         "recommended_action": "restart_deployment",
-        "action_target": "edge/api",
+        "action_target": action_target,
         "risk": HIGH_RISK,
         "rationale": "the deployment has no ready replicas",
     }

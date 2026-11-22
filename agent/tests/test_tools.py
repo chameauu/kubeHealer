@@ -21,6 +21,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import pytest
 from fastapi import HTTPException
+from kubernetes.client.exceptions import ApiException
 
 from tools import (
     ToolError,
@@ -169,27 +170,100 @@ async def test_chaos_502_surfaces_as_tool_error(fake_chaos_client: Any) -> None:
         await stop_scenario("scn-1")
 
 
-async def test_restart_deployment_sends_both_annotations(fake_kubectl: Any) -> None:
-    await restart_deployment("edge", "api")
+async def test_restart_deployment_patches_the_pod_template(fake_k8s: Any) -> None:
+    result = await restart_deployment("edge", "api")
 
-    assert len(fake_kubectl) == 1
-    argv = fake_kubectl[0]
-    blob = " ".join(argv)
-    assert "edge" in argv
-    assert "api" in argv
-    assert "kubectl.kubernetes.io/restartedAt" in blob
-    assert "kubeheal-agent/restarted-by" in blob
+    call = fake_k8s.last()
+    annotations = call.body["spec"]["template"]["metadata"]["annotations"]
+    assert call.method == "PATCH"
+    assert call.name == "api"
+    assert call.namespace == "edge"
+    assert set(annotations) == {
+        "kubectl.kubernetes.io/restartedAt",
+        "kubeheal-agent/restarted-by",
+    }
+    restarted_at = annotations["kubectl.kubernetes.io/restartedAt"]
+    assert restarted_at.endswith("Z")
+    assert annotations["kubeheal-agent/restarted-by"] == "kubeheal-agent"
+    assert result == {
+        "namespace": "edge",
+        "deployment": "api",
+        "restarted_at": restarted_at,
+    }
 
 
-async def test_scale_deployment_sends_replicas(fake_kubectl: Any) -> None:
-    await scale_deployment("edge", "api", 3)
+async def test_scale_deployment_patches_the_scale_subresource(fake_k8s: Any) -> None:
+    result = await scale_deployment("edge", "api", 3)
 
-    assert len(fake_kubectl) == 1
-    argv = fake_kubectl[0]
-    blob = " ".join(argv)
-    assert "edge" in argv
-    assert "api" in argv
-    assert ("--replicas" in argv and "3" in argv) or "replicas=3" in blob
+    call = fake_k8s.last()
+    assert call.method == "PATCH"
+    assert call.name == "api"
+    assert call.namespace == "edge"
+    assert call.body == {"spec": {"replicas": 3}}
+    assert result == {"namespace": "edge", "deployment": "api", "replicas": 3}
+
+
+async def test_client_error_becomes_tool_error(fake_k8s: Any) -> None:
+    fake_k8s.error = ApiException(status=500, reason="Internal Server Error")
+    fake_k8s.error.body = "boom from apiserver"
+
+    with pytest.raises(ToolError) as patched:
+        await restart_deployment("edge", "api")
+
+    message = str(patched.value)
+    assert "deployment patch failed" in message
+    assert "boom from apiserver" in message
+
+    with pytest.raises(ToolError) as scaled:
+        await scale_deployment("edge", "api", 3)
+
+    message = str(scaled.value)
+    assert "deployment scale failed" in message
+    assert "boom from apiserver" in message
+
+
+def test_clients_are_created_lazily_from_the_cluster_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kubernetes
+
+    import tools
+
+    # Nothing is built at import: the globals are the seam tests inject into.
+    assert tools._apps_api is None
+    assert tools._core_api is None
+
+    built: list[str] = []
+    loaded: list[str] = []
+
+    class FakeApps:
+        def __init__(self) -> None:
+            built.append("apps")
+
+    class FakeCore:
+        def __init__(self) -> None:
+            built.append("core")
+
+    def load_incluster_config() -> None:
+        loaded.append("incluster")
+
+    def load_kube_config() -> None:
+        loaded.append("kubeconfig")
+
+    monkeypatch.setattr(kubernetes.config, "load_incluster_config", load_incluster_config)
+    monkeypatch.setattr(kubernetes.config, "load_kube_config", load_kube_config)
+    monkeypatch.setattr(kubernetes.client, "AppsV1Api", FakeApps)
+    monkeypatch.setattr(kubernetes.client, "CoreV1Api", FakeCore)
+
+    first = tools._api_clients()
+    second = tools._api_clients()
+
+    assert loaded == ["incluster"]
+    assert built == ["apps", "core"]
+    assert first[0] is second[0]
+    assert first[1] is second[1]
+    assert first == (tools._apps_api, tools._core_api)
+
 
 
 def test_the_expected_query_is_the_documented_one() -> None:

@@ -16,6 +16,7 @@ spec:
       labels:
         app: kubeheal-graph
     spec:
+      serviceAccountName: kubeheal-graph
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -29,6 +30,13 @@ spec:
           env:
             - name: LOG_LEVEL
               value: INFO
+            # Read the real cluster: blast radius must describe the workload
+            # that is actually being faulted. There is no Hubble install here,
+            # so topology_sources honestly reports ["kubernetes"] and no flow
+            # edges are invented. Flip to "true" only to show the labelled
+            # synthetic fixture in kubeheal-demo.
+            - name: LOCAL_DEMO
+              value: "false"
           livenessProbe:
             httpGet: { path: /health, port: http }
             initialDelaySeconds: 5

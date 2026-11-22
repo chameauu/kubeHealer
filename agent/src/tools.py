@@ -1,4 +1,4 @@
-"""Outbound calls: graph, faultlib, chaos, kubectl.
+"""Outbound calls: graph, faultlib, chaos, and the Kubernetes write path.
 
 The graph query is frozen by CONTRACT D1:
 
@@ -9,12 +9,14 @@ Labels are sorted by key, each becomes its own repeated `selector` pair, and
 httpx percent-encodes the values. A blind source is reported (logged) and
 degraded to an empty mapping, never fabricated and never raised, so detection
 can continue with partial evidence.
+
+The write path talks to the Kubernetes API directly, authenticated with the
+pod's ServiceAccount; it never shells out to `kubectl`, which the image does
+not ship.
 """
 
 from __future__ import annotations
 
-import json
-import subprocess
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
@@ -24,12 +26,21 @@ import httpx
 from config import config
 from events import log_event
 
-HTTP_TIMEOUT_SECONDS = 3.0
+HTTP_TIMEOUT_SECONDS = 15.0
+# 15 s, not 3 s: inside a cluster pod an AF_UNSPEC resolution of a Service name
+# has been measured at ~2 s per call (the AAAA lookup waits for an upstream that
+# does not answer IPv6, and CoreDNS's search domains widen the wait). With 3 s the
+# first call could time out and detection silently degraded to `{}`, which then
+# read as "no evidence" instead of "backend unreachable".
 
 # Tests and operators replace these; `None` means "open a short-lived client".
 graph_client: Any = None
 faultlib_client: Any = None
 chaos_client: Any = None
+
+# The Kubernetes clients are built once per process; tests inject fakes here.
+_apps_api: Any = None
+_core_api: Any = None
 
 
 class ToolError(Exception):
@@ -159,13 +170,26 @@ async def get_scenario(scenario_id: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _run_kubectl(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, check=True, capture_output=True, text=True)
+def _api_clients() -> tuple[Any, Any]:
+    """Return the apps and core clients, building them once from the pod config."""
+    global _apps_api, _core_api
+    if _apps_api is None or _core_api is None:
+        import kubernetes
+
+        try:
+            kubernetes.config.load_incluster_config()
+        except Exception:
+            kubernetes.config.load_kube_config()
+        if _apps_api is None:
+            _apps_api = kubernetes.client.AppsV1Api()
+        if _core_api is None:
+            _core_api = kubernetes.client.CoreV1Api()
+    return _apps_api, _core_api
 
 
 async def restart_deployment(namespace: str, name: str) -> dict[str, Any]:
     """Roll a deployment by stamping the pod template, not just the object."""
-    restarted_at = datetime.now(timezone.utc).isoformat()
+    restarted_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     patch = {
         "spec": {
             "template": {
@@ -178,21 +202,13 @@ async def restart_deployment(namespace: str, name: str) -> dict[str, Any]:
             }
         }
     }
-    argv = [
-        "kubectl",
-        "-n",
-        namespace,
-        "patch",
-        "deployment",
-        name,
-        "--type=merge",
-        "-p",
-        json.dumps(patch),
-    ]
     try:
-        _run_kubectl(argv)
+        apps_api, _ = _api_clients()
+        apps_api.patch_namespaced_deployment(
+            name=name, namespace=namespace, body=patch
+        )
     except Exception as exc:
-        raise ToolError(f"kubectl patch failed: {exc}") from exc
+        raise ToolError(f"deployment patch failed: {exc}") from exc
     return {"namespace": namespace, "deployment": name, "restarted_at": restarted_at}
 
 
@@ -200,18 +216,13 @@ async def scale_deployment(
     namespace: str, name: str, replicas: int
 ) -> dict[str, Any]:
     """Set a deployment's replica count."""
-    argv = [
-        "kubectl",
-        "-n",
-        namespace,
-        "scale",
-        "deployment",
-        name,
-        "--replicas",
-        str(replicas),
-    ]
+    body = {"spec": {"replicas": int(replicas)}}
     try:
-        _run_kubectl(argv)
+        apps_api, _ = _api_clients()
+        apps_api.patch_namespaced_deployment_scale(
+            name=name, namespace=namespace, body=body
+        )
     except Exception as exc:
-        raise ToolError(f"kubectl scale failed: {exc}") from exc
-    return {"namespace": namespace, "deployment": name, "replicas": replicas}
+        raise ToolError(f"deployment scale failed: {exc}") from exc
+    return {"namespace": namespace, "deployment": name, "replicas": int(replicas)}
+

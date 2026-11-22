@@ -29,6 +29,10 @@ spec:
           env:
             - name: LOG_LEVEL
               value: INFO
+            # The catalogue refuses to offer a fault it cannot inject, so it
+            # has to know where the chaos service answers.
+            - name: CHAOS_URL
+              value: http://kubeheal-chaos.kubeheal-system.svc.cluster.local
           livenessProbe:
             httpGet: { path: /health, port: http }
             initialDelaySeconds: 5

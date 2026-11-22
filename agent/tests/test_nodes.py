@@ -250,16 +250,69 @@ async def test_verify_polls_until_terminal_and_computes_mttr(monkeypatch: Any) -
 
 async def test_verify_fails_at_the_deadline_while_still_running(monkeypatch: Any) -> None:
     clock = _install_clock(monkeypatch)
+    calls: list[str] = []
 
     async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {"id": "sc-1", "status": "running"}
+
+    async def stop_scenario(scenario_id: str) -> dict[str, Any]:
+        calls.append(scenario_id)
+        raise RuntimeError("stop refused")
+
+    monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "stop_scenario", stop_scenario)
+
+    result = await nodes.verify(_state())
+
+    assert result["verify_result"] == "failed"
+    assert calls == ["sc-1"]
+    assert clock.slept >= 55.0
+
+
+async def test_verify_survives_a_transient_read_error(monkeypatch: Any) -> None:
+    # One failed read is not evidence that the system did not recover: the
+    # backend can blip while the fault is being cleaned up.
+    _install_clock(monkeypatch)
+    responses: list[Any] = [
+        RuntimeError("chaos unreachable"),
+        {"id": "sc-1", "status": "completed", "ended_at": "2026-11-22T12:01:40+00:00"},
+    ]
+
+    async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        item = responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
     monkeypatch.setattr(nodes, "get_scenario", get_scenario)
 
     result = await nodes.verify(_state())
 
+    assert result["verify_result"] in {"recovered", "stopped", "completed"}
+    assert result["mttr_seconds"] == 100.0
+    assert not responses
+
+
+async def test_verify_fails_at_the_deadline_naming_the_last_read_error(
+    monkeypatch: Any,
+) -> None:
+    clock = _install_clock(monkeypatch)
+    reasons: list[str] = []
+
+    async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("chaos unreachable")
+
+    def log_event(_event: str, **fields: Any) -> None:
+        reasons.append(str(fields.get("reason")))
+
+    monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "log_event", log_event)
+
+    result = await nodes.verify(_state())
+
     assert result["verify_result"] == "failed"
     assert 55.0 <= clock.slept <= 70.0
+    assert reasons and "chaos unreachable" in reasons[-1]
 
 
 async def test_report_writes_memory_and_closes_the_run_done(monkeypatch: Any) -> None:
@@ -292,3 +345,56 @@ async def test_report_writes_memory_and_closes_the_run_done(monkeypatch: Any) ->
     assert recorded and recorded[0]["outcome"] == "success"
     assert store.saved and store.saved[-1]["status"] == "done"
     assert result.get("status") == "done"
+
+
+async def test_verify_stops_its_own_fault_at_the_deadline(monkeypatch: Any) -> None:
+    # A pod-kill has nothing to restore, so Chaos Mesh never reports recovery and
+    # the scenario would stay `running` forever. The fault is ours: stop it, and
+    # let the stop produce the terminal state the MTTR is measured from.
+    _install_clock(monkeypatch)
+    stopped = {"done": False}
+    calls: list[str] = []
+
+    async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        if stopped["done"]:
+            return {
+                "id": "sc-1",
+                "status": "stopped",
+                "ended_at": "2026-11-22T12:02:00+00:00",
+            }
+        return {"id": "sc-1", "status": "running"}
+
+    async def stop_scenario(scenario_id: str) -> dict[str, Any]:
+        calls.append(scenario_id)
+        stopped["done"] = True
+        return {"id": scenario_id, "status": "stopped"}
+
+    monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "stop_scenario", stop_scenario)
+
+    result = await nodes.verify(_state())
+
+    assert calls == ["sc-1"]
+    assert result["verify_result"] == "recovered"
+    assert result["mttr_seconds"] == 120.0
+
+
+async def test_verify_fails_closed_when_the_stop_does_not_help(monkeypatch: Any) -> None:
+    clock = _install_clock(monkeypatch)
+    calls: list[str] = []
+
+    async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"id": "sc-1", "status": "running"}
+
+    async def stop_scenario(scenario_id: str) -> dict[str, Any]:
+        calls.append(scenario_id)
+        raise RuntimeError("chaos unreachable")
+
+    monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "stop_scenario", stop_scenario)
+
+    result = await nodes.verify(_state())
+
+    assert calls == ["sc-1"]
+    assert result["verify_result"] == "failed"
+    assert clock.slept >= 55.0

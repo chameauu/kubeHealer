@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kubeheal-agent-data
+  namespace: kubeheal-system
+  labels:
+    app: kubeheal-agent
+    app.kubernetes.io/part-of: kubeheal
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

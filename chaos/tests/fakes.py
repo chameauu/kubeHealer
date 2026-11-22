@@ -61,6 +61,20 @@ class FakeChaosMeshClient:
         """Drop an object without recording a call: the CR vanished on its own."""
         self.objects.pop((namespace, name), None)
 
+    def recover(self, namespace: str, name: str) -> None:
+        """Report full recovery on a CR that stays in the cluster.
+
+        Chaos Mesh reports `AllRecovered: True` at the end of an experiment but
+        keeps the object until someone deletes it; that gap is the defect these
+        tests pin down.
+        """
+        stored = self.objects.get((namespace, name))
+        if stored is not None:
+            stored.setdefault("status", {})["conditions"] = [
+                {"type": "Injected", "status": "True"},
+                {"type": "AllRecovered", "status": "True"},
+            ]
+
 
 class ExplodingChaosMeshClient(FakeChaosMeshClient):
     """Every apply is refused by the admission webhook."""

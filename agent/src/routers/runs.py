@@ -37,20 +37,46 @@ class StartRunRequest(BaseModel):
     scenario_id: str | None = None
 
 
+def _verification_failed(verify_result: Any) -> bool:
+    """Whether the run's own verification says it failed, whatever its shape."""
+    if isinstance(verify_result, str):
+        return verify_result.startswith("failed")
+    if isinstance(verify_result, dict):
+        status = verify_result.get("status")
+        return isinstance(status, str) and status.startswith("failed")
+    return False
+
+
 def _derive_status(document: dict[str, Any]) -> str:
-    status = document.get("status")
-    if status in TERMINAL_STATUSES:
-        return str(status)
     node = document.get("node")
     if node == "aborted":
         return "aborted"
+    # Reaching `report` means the pipeline finished, not that it succeeded:
+    # `AgentState` carries no `status`, so a failed verification still lands
+    # here with the run's earlier status. Failure must win over `done`.
+    if _verification_failed(document.get("verify_result")):
+        return "error"
+    status = document.get("status")
+    if status in TERMINAL_STATUSES:
+        return str(status)
     if node == "report":
         return "done"
     if node == "error":
         return "error"
+    # The interrupt sits between `heal_plan` and `execute`, so a parked run's
+    # projection still names the node that just finished. `approval_status` is
+    # what the gate actually records; deriving from `node` alone reported
+    # `running` for a run that was waiting for a human.
+    if document.get("approval_status") == "pending":
+        return "awaiting_approval"
     if node == "approve":
         return "awaiting_approval"
     return "running"
+
+
+def _outward(document: dict[str, Any]) -> dict[str, Any]:
+    """The stored document with its derived status, so reads cannot disagree."""
+    return {**document, "status": _derive_status(document)}
 
 
 def _not_found(scenario_id: str) -> HTTPException:
@@ -67,6 +93,7 @@ def _not_pending(scenario_id: str) -> HTTPException:
 @router.get("/runs")
 async def list_runs(status: str | None = None) -> dict[str, Any]:
     runs = await store.list(status) if status else await store.list()
+    runs = [_outward(document) for document in runs]
     return {"runs": runs, "total": len(runs)}
 
 
@@ -75,7 +102,7 @@ async def get_run(scenario_id: str) -> dict[str, Any]:
     document = await store.get(scenario_id)
     if document is None:
         raise _not_found(scenario_id)
-    return document
+    return _outward(document)
 
 
 async def _resume(

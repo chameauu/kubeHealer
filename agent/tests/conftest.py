@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json as jsonlib
 import os
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -187,22 +186,54 @@ def fake_chaos_client(monkeypatch: pytest.MonkeyPatch) -> FakeHTTPClient:
     return fake
 
 
-@pytest.fixture
-def fake_kubectl(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
-    """Capture the `kubectl` argv instead of touching a cluster.
+class K8sCall:
+    """One call a tool issued against the Kubernetes apps/v1 API."""
 
-    `restart_deployment` and `scale_deployment` mutate workloads through
-    `kubectl`, so they are exercised through `tools.subprocess.run`.
-    """
+    def __init__(self, method: str, name: str, namespace: str, body: Any) -> None:
+        self.method = method
+        self.name = name
+        self.namespace = namespace
+        self.body = body
+
+    def __repr__(self) -> str:
+        return f"K8sCall({self.method} {self.namespace}/{self.name} body={self.body!r})"
+
+
+class FakeAppsApi:
+    """Records `patch_namespaced_*` calls instead of touching a cluster."""
+
+    def __init__(self) -> None:
+        self.calls: list[K8sCall] = []
+        self.error: Exception | None = None
+
+    def _record(self, method: str, name: str, namespace: str, body: Any) -> Any:
+        if self.error is not None:
+            raise self.error
+        self.calls.append(K8sCall(method, name, namespace, body))
+        return body
+
+    def patch_namespaced_deployment(
+        self, name: str, namespace: str, body: Any, **_kwargs: Any
+    ) -> Any:
+        return self._record("PATCH", name, namespace, body)
+
+    def patch_namespaced_deployment_scale(
+        self, name: str, namespace: str, body: Any, **_kwargs: Any
+    ) -> Any:
+        return self._record("PATCH", name, namespace, body)
+
+    def last(self) -> K8sCall:
+        assert self.calls, "the tool issued no Kubernetes call"
+        return self.calls[-1]
+
+
+@pytest.fixture
+def fake_k8s(monkeypatch: pytest.MonkeyPatch) -> FakeAppsApi:
+    """Inject a recording apps client through the module globals."""
     import tools
 
-    calls: list[list[str]] = []
+    fake = FakeAppsApi()
+    monkeypatch.setattr(tools, "_apps_api", fake)
+    monkeypatch.setattr(tools, "_core_api", object())
+    return fake
 
-    def run(*args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
-        first = args[0] if len(args) == 1 and isinstance(args[0], (list, tuple)) else args
-        argv = [str(part) for part in first]
-        calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(tools.subprocess, "run", run)
-    return calls

@@ -13,9 +13,11 @@ FROM nginx:alpine
 
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY --from=build /app/dist /usr/share/nginx/html
+COPY docker-entrypoint.sh /usr/local/bin/kubeheal-entrypoint.sh
 
-# `nginx -t` cannot run here: the resolver is an in-cluster name, and nginx
-# resolves it while loading the configuration.
+# nginx resolves `resolver` while loading the configuration, and the cluster DNS
+# address is only known inside the pod, so the entrypoint renders the config at
+# startup. `nginx -t` cannot run at build time for the same reason.
 
 # nginx:alpine ships the nginx user as uid 101. Use the numeric ids so the
 # Kubernetes runAsNonRoot check can verify them, and keep the web root read-only.
@@ -29,4 +31,4 @@ EXPOSE 8080
 HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
     CMD wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1
 
-ENTRYPOINT ["nginx", "-g", "daemon off;"]
+ENTRYPOINT ["/usr/local/bin/kubeheal-entrypoint.sh"]

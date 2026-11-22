@@ -35,6 +35,9 @@ TERMINAL_SCENARIO_STATUSES = frozenset({"stopped", "completed"})
 SUCCESS_VERIFY_RESULTS = frozenset({"recovered", "stopped", "completed"})
 ALLOWED_ACTIONS = frozenset({"restart_deployment", "stop_scenario", "scale_deployment"})
 POLL_INTERVAL_SECONDS = 5.0
+# After the verify deadline the fault is stopped and polled briefly: a pod-kill
+# CR never reports recovery, so the stop is what produces the terminal state.
+VERIFY_GRACE_SECONDS = 15.0
 DEFAULT_DOMAIN = "chaos_mesh"
 
 
@@ -295,6 +298,12 @@ def _mttr_seconds(state: AgentState, scenario: dict[str, Any]) -> float | None:
     return (ended - started).total_seconds()
 
 
+def _describe_error(exc: Exception) -> str:
+    """Name the exception when its message is empty — httpx timeouts are."""
+    text = str(exc).strip()
+    return text or exc.__class__.__name__
+
+
 def _failed_verify(reason: str) -> dict[str, Any]:
     log_event("agent.verify.failed", reason=reason)
     return {
@@ -309,13 +318,23 @@ async def verify(state: AgentState) -> dict[str, Any]:
     """Poll the backend up to the deadline; a timeout while running fails."""
     scenario_id = str(state.get("scenario_id") or "")
     deadline = now() + timedelta(seconds=int(config.VERIFY_TIMEOUT_SECONDS))
+    last_read_error: str | None = None
+    status = ""
+    stop_requested = False
     while True:
         try:
             scenario = await get_scenario(scenario_id)
+            last_read_error = None
         except Exception as exc:
-            return _failed_verify(f"scenario unreadable: {exc}")
-        status = str((scenario or {}).get("status") or "")
-        if status in TERMINAL_SCENARIO_STATUSES:
+            # One failed read is not evidence that the system did not recover:
+            # the backend can blip while the fault is being cleaned up, and
+            # treating that as terminal turned a recovering incident into a
+            # failed run. Keep polling and only report it if it is all we saw.
+            scenario = None
+            last_read_error = _describe_error(exc)
+        if scenario is not None:
+            status = str((scenario or {}).get("status") or "")
+        if scenario is not None and status in TERMINAL_SCENARIO_STATUSES:
             mttr = _mttr_seconds(state, scenario or {})
             return {
                 "node": "verify",
@@ -324,6 +343,19 @@ async def verify(state: AgentState) -> dict[str, Any]:
                 "updated_at": now().isoformat(),
             }
         if now() >= deadline:
+            if not stop_requested and status == "running":
+                # The fault is ours to end. A pod-kill has nothing to restore,
+                # so the backend never reports recovery; polling longer would
+                # turn a recoverable incident into a failed run.
+                stop_requested = True
+                deadline = now() + timedelta(seconds=int(VERIFY_GRACE_SECONDS))
+                try:
+                    await stop_scenario(scenario_id)
+                except Exception as exc:
+                    last_read_error = _describe_error(exc)
+                continue
+            if last_read_error is not None and not status:
+                return _failed_verify(f"scenario unreadable: {last_read_error}")
             return _failed_verify(f"deadline reached while {status or 'unknown'}")
         await sleep(POLL_INTERVAL_SECONDS)
 

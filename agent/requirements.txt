@@ -3,6 +3,8 @@ uvicorn[standard]==0.30.0
 pydantic>=2.9.0
 pydantic-settings>=2.5.0
 httpx==0.27.0
+# The write path: patches Deployments in-cluster, so the pod needs RBAC (k8s/rbac.yaml).
+kubernetes==30.1.0
 structlog==24.1.0
 langgraph==1.2.24
 langgraph-checkpoint-sqlite==3.1.3
