@@ -16,6 +16,7 @@ spec:
       labels:
         app: kubeheal-chaos
     spec:
+      serviceAccountName: kubeheal-chaos
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -29,6 +30,13 @@ spec:
           env:
             - name: LOG_LEVEL
               value: INFO
+            - name: SIMULATOR_URL
+              value: http://kubeheal-sim.kubeheal-system.svc.cluster.local
+            # Persistence is a PVC once the cluster gate lands; until then the
+            # document store lives on the container filesystem and is lost on
+            # reschedule, which the restart reconciliation tolerates.
+            - name: CHAOS_DB_PATH
+              value: /app/data/chaos.db
           livenessProbe:
             httpGet: { path: /health, port: http }
             initialDelaySeconds: 5
