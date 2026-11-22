@@ -1,0 +1,15 @@
+{
+  "captured_from": "authored_fixture",
+  "model": null,
+  "59e7c3105c520bd789e1c388247a40c689b8f7bb6d706f22156c89ed1476f009": {
+    "causal_chain": [
+      "pod terminated",
+      "no ready replicas",
+      "downstream 503s"
+    ],
+    "recommended_action": "restart_deployment",
+    "action_target": "edge/api",
+    "risk": "high",
+    "rationale": "the deployment has no ready replicas; a restart restores capacity"
+  }
+}

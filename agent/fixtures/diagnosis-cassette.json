@@ -1,0 +1,48 @@
+{
+  "captured_from": "authored_fixture",
+  "model": null,
+  "demo_payload": {
+    "scenario": {
+      "id": "sc-demo-pod-kill",
+      "fault_type": "pod_kill",
+      "domain": "chaos_mesh",
+      "status": "running",
+      "target": {
+        "namespace": "edge",
+        "label_selector": {
+          "app": "api"
+        }
+      },
+      "started_at": "2026-11-22T12:00:00+00:00"
+    },
+    "blast_radius": {
+      "target_namespace": "edge",
+      "affected_nodes": [
+        {
+          "node_id": "edge/api",
+          "distance_hops": 0
+        }
+      ],
+      "topology_sources": [
+        "synthetic_fixture"
+      ]
+    },
+    "catalog_entry": {
+      "domain": "chaos_mesh",
+      "fault_type": "pod_kill",
+      "blast_radius": "single_deployment"
+    },
+    "memory_context": null
+  },
+  "3bb49d480602ce27166670358c957905acff392912403d5d6e4466627eb2dd51": {
+    "causal_chain": [
+      "pod terminated",
+      "no ready replicas",
+      "downstream 503s"
+    ],
+    "recommended_action": "restart_deployment",
+    "action_target": "edge/api",
+    "risk": "high",
+    "rationale": "the deployment has no ready replicas; a restart restores capacity"
+  }
+}

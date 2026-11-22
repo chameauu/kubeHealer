@@ -2,31 +2,42 @@
 
 Shape (CONTRACT D2):
 
-    detect → diagnose → heal_plan ─┬─(risk=low)────────────────────────┐
-                                   └─(risk=high)→ approve (interrupt) ─┤
-                                                                       ▼
-                                              execute → verify → report → END
-                                                        rejected → aborted → END
+    detect -> diagnose -> heal_plan
+        +--(risk=low)----------------------------> execute
+        +--(risk=high)--> approve (interrupt) ---> execute
+    execute -> verify -> report -> END
+    rejected at approve ------------------------> aborted -> END
 
-`interrupt()` is never inside a node that also performs work: the `approve`
-node only reads the decision and records it, so re-running it on resume is
-side-effect free.
+The node bodies live in `nodes.py`; this module owns the wiring and the
+interrupt. `interrupt()` is never inside a node that also performs work: the
+`approve` node only reads the decision and records it, so re-running it on
+resume is side-effect free.
+
+LangGraph runs the graph synchronously (`invoke`) and the node bodies are
+async (they do HTTP and polling), so each wrapper drives its coroutine to
+completion. When `invoke` is called from inside a running event loop the
+coroutine is driven in a worker thread instead of a nested loop.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any, Callable
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Coroutine
 
 from langgraph.graph import END, StateGraph
 from langgraph.types import Command, interrupt
 
+import nodes
 from state import AgentState, new_state, utcnow
 
 DiagnosisProvider = Callable[..., dict[str, Any]]
 ExecuteFn = Callable[[AgentState], str]
 
 HIGH_RISK = "high"
+
+_STATE_KEYS = frozenset(AgentState.__annotations__)
+
 
 # Config for one run: thread_id == scenario_id (CONTRACT D2, rule 2).
 def thread_config(scenario_id: str) -> dict[str, Any]:
@@ -52,25 +63,31 @@ def stub_diagnosis(**_context: Any) -> dict[str, Any]:
     }
 
 
+def _run_async(coroutine: Coroutine[Any, Any, Any]) -> Any:
+    """Run one node coroutine from the synchronous graph runtime."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coroutine)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coroutine).result()
+
+
+def _clean(partial: dict[str, Any]) -> dict[str, Any]:
+    """Keep only keys the frozen `AgentState` declares."""
+    return {key: value for key, value in partial.items() if key in _STATE_KEYS}
+
+
 def _detect(state: AgentState) -> dict[str, Any]:
-    return {"node": "detect", "updated_at": utcnow()}
+    return _clean(_run_async(nodes.detect(state)))
 
 
-def _diagnose(state: AgentState, provider: DiagnosisProvider) -> dict[str, Any]:
-    diagnosis = provider(
-        scenario=state["scenario"],
-        blast_radius=state["blast_radius"],
-        catalog_entry=state["catalog_entry"],
-        memory_context=state["memory_context"],
-    )
-    return {"node": "diagnose", "diagnosis": diagnosis, "updated_at": utcnow()}
+def _diagnose(state: AgentState, provider: DiagnosisProvider | None) -> dict[str, Any]:
+    return _clean(_run_async(nodes.diagnose(state, provider=provider)))
 
 
 def _heal_plan(state: AgentState) -> dict[str, Any]:
-    risk = (state["diagnosis"] or {}).get("risk", HIGH_RISK)
-    if risk == HIGH_RISK:
-        return {"node": "heal_plan", "approval_status": "pending", "updated_at": utcnow()}
-    return {"node": "heal_plan", "approval_status": "not_required", "updated_at": utcnow()}
+    return _clean(_run_async(nodes.heal_plan(state)))
 
 
 def _approve(state: AgentState) -> dict[str, Any]:
@@ -103,20 +120,22 @@ def _route_after_approve(state: AgentState) -> str:
     return "execute" if state["approval_status"] == "approved" else "aborted"
 
 
-def _execute(state: AgentState, run_action: ExecuteFn) -> dict[str, Any]:
-    return {"node": "execute", "action_result": run_action(state), "updated_at": utcnow()}
+def _execute(state: AgentState, run_action: ExecuteFn | None) -> dict[str, Any]:
+    if run_action is not None:
+        return {
+            "node": "execute",
+            "action_result": run_action(state),
+            "updated_at": utcnow(),
+        }
+    return _clean(_run_async(nodes.execute(state)))
 
 
 def _verify(state: AgentState) -> dict[str, Any]:
-    return {"node": "verify", "verify_result": "recovered", "updated_at": utcnow()}
+    return _clean(_run_async(nodes.verify(state)))
 
 
 def _report(state: AgentState) -> dict[str, Any]:
-    started = datetime.fromisoformat(state["started_at"])
-    if started.tzinfo is None:
-        started = started.replace(tzinfo=timezone.utc)
-    mttr = (datetime.now(timezone.utc) - started).total_seconds()
-    return {"node": "report", "mttr_seconds": mttr, "updated_at": utcnow()}
+    return _clean(_run_async(nodes.report(state)))
 
 
 def _aborted(state: AgentState) -> dict[str, Any]:
@@ -132,17 +151,16 @@ def build_graph(
     """Compile the run graph.
 
     `checkpointer` is required for the approval interrupt; without it LangGraph
-    cannot suspend and `interrupt()` raises.
+    cannot suspend and `interrupt()` raises. A `None` provider means the
+    `nodes.diagnosis_provider` seam; a `None` execute function means the real
+    tool dispatch in `nodes.execute`.
     """
-    provider = diagnosis_provider or stub_diagnosis
-    run_action: ExecuteFn = execute_fn or (lambda _state: "ok")
-
     builder: StateGraph = StateGraph(AgentState)
     builder.add_node("detect", _detect)
-    builder.add_node("diagnose", lambda state: _diagnose(state, provider))
+    builder.add_node("diagnose", lambda state: _diagnose(state, diagnosis_provider))
     builder.add_node("heal_plan", _heal_plan)
     builder.add_node("approve", _approve)
-    builder.add_node("execute", lambda state: _execute(state, run_action))
+    builder.add_node("execute", lambda state: _execute(state, execute_fn))
     builder.add_node("verify", _verify)
     builder.add_node("report", _report)
     builder.add_node("aborted", _aborted)

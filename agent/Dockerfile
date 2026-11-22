@@ -10,6 +10,9 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 COPY --from=deps /install/lib/python3.11/site-packages /app/deps
 COPY src /app/src
+# The authored diagnosis cassette ships with the image so LLM_MODE=cassette
+# works without a key; CASSETTE_PATH defaults to this relative path.
+COPY fixtures /app/fixtures
 RUN useradd --uid 1000 --create-home appuser && chown -R 1000:1000 /app
 USER 1000
 EXPOSE 8080
