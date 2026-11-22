@@ -26,18 +26,15 @@ from tools import (
     get_blast_radius,
     get_catalog_entry,
     get_scenario,
+    get_workload_health,
     restart_deployment,
     scale_deployment,
     stop_scenario,
 )
 
-TERMINAL_SCENARIO_STATUSES = frozenset({"stopped", "completed"})
 SUCCESS_VERIFY_RESULTS = frozenset({"recovered", "stopped", "completed"})
 ALLOWED_ACTIONS = frozenset({"restart_deployment", "stop_scenario", "scale_deployment"})
 POLL_INTERVAL_SECONDS = 5.0
-# After the verify deadline the fault is stopped and polled briefly: a pod-kill
-# CR never reports recovery, so the stop is what produces the terminal state.
-VERIFY_GRACE_SECONDS = 15.0
 DEFAULT_DOMAIN = "chaos_mesh"
 
 
@@ -280,22 +277,31 @@ async def execute(state: AgentState) -> dict[str, Any]:
     return {"node": "execute", "action_result": result, "updated_at": utcnow()}
 
 
-def _mttr_seconds(state: AgentState, scenario: dict[str, Any]) -> float | None:
-    scenario_doc = state.get("scenario") or {}
-    started_raw = scenario_doc.get("started_at") or state.get("started_at")
-    ended_raw = scenario.get("ended_at")
-    if not started_raw or not ended_raw:
+def _parse_timestamp(raw: Any) -> datetime | None:
+    if not raw:
         return None
     try:
-        started = datetime.fromisoformat(str(started_raw))
-        ended = datetime.fromisoformat(str(ended_raw))
+        value = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
     except ValueError:
         return None
-    if started.tzinfo is None:
-        started = started.replace(tzinfo=timezone.utc)
-    if ended.tzinfo is None:
-        ended = ended.replace(tzinfo=timezone.utc)
-    return (ended - started).total_seconds()
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _mttr_seconds(
+    state: AgentState, scenario: dict[str, Any] | None
+) -> float | None:
+    """Scenario start to its recorded end, else to now; `None` if unparseable."""
+    document = scenario or {}
+    scenario_doc = state.get("scenario") or {}
+    started = _parse_timestamp(
+        document.get("started_at") or scenario_doc.get("started_at")
+    )
+    if started is None:
+        return None
+    ended = _parse_timestamp(document.get("ended_at")) or now()
+    return round((ended - started).total_seconds(), 2)
 
 
 def _describe_error(exc: Exception) -> str:
@@ -314,49 +320,74 @@ def _failed_verify(reason: str) -> dict[str, Any]:
     }
 
 
+def _workload_target(diagnosis: dict[str, Any] | None) -> tuple[str, str] | None:
+    """Split the diagnosis `action_target` (`<namespace>/<deployment>`)."""
+    text = str((diagnosis or {}).get("action_target") or "").strip()
+    parts = text.split("/")
+    if len(parts) != 2:
+        return None
+    namespace, deployment = (part.strip() for part in parts)
+    if not namespace or not deployment:
+        return None
+    return namespace, deployment
+
+
+def _workload_healthy(health: dict[str, Any]) -> bool:
+    """The workload is back only when replicas are actually serving."""
+    desired = int(health.get("desired") or 0)
+    available = int(health.get("available") or 0)
+    ready = int(health.get("ready") or 0)
+    return desired > 0 and (available >= desired or ready >= desired)
+
+
 async def verify(state: AgentState) -> dict[str, Any]:
-    """Poll the backend up to the deadline; a timeout while running fails."""
+    """Poll workload health; recovery is the workload's, never our own write."""
+    target = _workload_target(state.get("diagnosis"))
+    if target is None:
+        return _failed_verify("no workload target to verify")
+    namespace, deployment = target
     scenario_id = str(state.get("scenario_id") or "")
-    deadline = now() + timedelta(seconds=int(config.VERIFY_TIMEOUT_SECONDS))
-    last_read_error: str | None = None
-    status = ""
-    stop_requested = False
+    timeout = int(config.VERIFY_TIMEOUT_SECONDS)
+    deadline = now() + timedelta(seconds=timeout)
+    last_scenario_error: str | None = None
+    last_health_error: str | None = None
+    scenario: dict[str, Any] | None = None
+    health: dict[str, Any] | None = None
     while True:
         try:
             scenario = await get_scenario(scenario_id)
-            last_read_error = None
+            last_scenario_error = None
         except Exception as exc:
             # One failed read is not evidence that the system did not recover:
             # the backend can blip while the fault is being cleaned up, and
             # treating that as terminal turned a recovering incident into a
             # failed run. Keep polling and only report it if it is all we saw.
             scenario = None
-            last_read_error = _describe_error(exc)
-        if scenario is not None:
-            status = str((scenario or {}).get("status") or "")
-        if scenario is not None and status in TERMINAL_SCENARIO_STATUSES:
-            mttr = _mttr_seconds(state, scenario or {})
+            last_scenario_error = _describe_error(exc)
+        try:
+            health = await get_workload_health(namespace, deployment)
+            last_health_error = None
+        except Exception as exc:
+            health = None
+            last_health_error = _describe_error(exc)
+        if health is not None and _workload_healthy(health):
             return {
                 "node": "verify",
                 "verify_result": "recovered",
-                "mttr_seconds": mttr,
+                "mttr_seconds": _mttr_seconds(state, scenario),
                 "updated_at": now().isoformat(),
             }
         if now() >= deadline:
-            if not stop_requested and status == "running":
-                # The fault is ours to end. A pod-kill has nothing to restore,
-                # so the backend never reports recovery; polling longer would
-                # turn a recoverable incident into a failed run.
-                stop_requested = True
-                deadline = now() + timedelta(seconds=int(VERIFY_GRACE_SECONDS))
-                try:
-                    await stop_scenario(scenario_id)
-                except Exception as exc:
-                    last_read_error = _describe_error(exc)
-                continue
-            if last_read_error is not None and not status:
-                return _failed_verify(f"scenario unreadable: {last_read_error}")
-            return _failed_verify(f"deadline reached while {status or 'unknown'}")
+            desired = int((health or {}).get("desired") or 0)
+            available = int((health or {}).get("available") or 0)
+            reason = (
+                f"workload not ready: {available}/{desired} replicas after {timeout}s"
+            )
+            if last_health_error is not None:
+                reason += f" (last health error: {last_health_error})"
+            if last_scenario_error is not None:
+                reason += f" (last scenario error: {last_scenario_error})"
+            return _failed_verify(reason)
         await sleep(POLL_INTERVAL_SECONDS)
 
 

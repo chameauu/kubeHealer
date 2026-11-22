@@ -205,6 +205,8 @@ class FakeAppsApi:
     def __init__(self) -> None:
         self.calls: list[K8sCall] = []
         self.error: Exception | None = None
+        self.deployment: Any = None
+        self.read_error: Exception | None = None
 
     def _record(self, method: str, name: str, namespace: str, body: Any) -> Any:
         if self.error is not None:
@@ -222,18 +224,51 @@ class FakeAppsApi:
     ) -> Any:
         return self._record("PATCH", name, namespace, body)
 
+    def read_namespaced_deployment(
+        self, name: str, namespace: str, **_kwargs: Any
+    ) -> Any:
+        if self.read_error is not None:
+            raise self.read_error
+        self.calls.append(K8sCall("GET", name, namespace, None))
+        return self.deployment
+
     def last(self) -> K8sCall:
         assert self.calls, "the tool issued no Kubernetes call"
         return self.calls[-1]
 
 
+class FakeCoreApi:
+    """Records `list_namespaced_pod` calls and replays a pod list."""
+
+    def __init__(self) -> None:
+        self.calls: list[K8sCall] = []
+        self.label_selectors: list[str | None] = []
+        self.pods: Any = None
+        self.error: Exception | None = None
+
+    def list_namespaced_pod(
+        self, namespace: str, label_selector: str | None = None, **_kwargs: Any
+    ) -> Any:
+        self.calls.append(K8sCall("GET", "pods", namespace, None))
+        self.label_selectors.append(label_selector)
+        if self.error is not None:
+            raise self.error
+        return self.pods
+
+    def last(self) -> K8sCall:
+        assert self.calls, "the tool issued no pod-list call"
+        return self.calls[-1]
+
+
 @pytest.fixture
 def fake_k8s(monkeypatch: pytest.MonkeyPatch) -> FakeAppsApi:
-    """Inject a recording apps client through the module globals."""
+    """Inject recording apps and core clients through the module globals."""
     import tools
 
     fake = FakeAppsApi()
+    core = FakeCoreApi()
+    fake.core = core  # type: ignore[attr-defined]
     monkeypatch.setattr(tools, "_apps_api", fake)
-    monkeypatch.setattr(tools, "_core_api", object())
+    monkeypatch.setattr(tools, "_core_api", core)
     return fake
 

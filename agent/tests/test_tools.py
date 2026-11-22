@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
@@ -27,6 +28,7 @@ from tools import (
     ToolError,
     get_blast_radius,
     get_catalog_entry,
+    get_workload_health,
     restart_deployment,
     scale_deployment,
     stop_scenario,
@@ -222,12 +224,122 @@ async def test_client_error_becomes_tool_error(fake_k8s: Any) -> None:
     assert "boom from apiserver" in message
 
 
+def _deployment(
+    desired: int = 3,
+    ready: int | None = 2,
+    available: int | None = 2,
+    labels: dict[str, str] | None = None,
+) -> Any:
+    return SimpleNamespace(
+        spec=SimpleNamespace(
+            replicas=desired,
+            selector=SimpleNamespace(
+                match_labels={"tier": "web", "app": "api"}
+                if labels is None
+                else labels
+            ),
+        ),
+        status=SimpleNamespace(ready_replicas=ready, available_replicas=available),
+    )
+
+
+def _pod(phase: str = "Running", ready: bool = True) -> Any:
+    return SimpleNamespace(
+        status=SimpleNamespace(
+            phase=phase,
+            conditions=[SimpleNamespace(type="Ready", status="True" if ready else "False")],
+        )
+    )
+
+
+def _pods(*items: Any) -> Any:
+    return SimpleNamespace(items=list(items))
+
+
+async def test_workload_health_maps_deployment_status_and_ready_pods(
+    fake_k8s: Any,
+) -> None:
+    fake_k8s.deployment = _deployment(desired=3, ready=2, available=2)
+    fake_k8s.core.pods = _pods(
+        _pod(), _pod(), _pod(ready=False), _pod(phase="Pending", ready=True)
+    )
+
+    health = await get_workload_health("edge", "api")
+
+    assert health["namespace"] == "edge"
+    assert health["deployment"] == "api"
+    assert health["desired"] == 3
+    assert health["ready"] == 2
+    assert health["available"] == 2
+    assert health["ready_pods"] == 2
+    assert health["observed_at"]
+    # The selector is the deployment's, with stable label ordering.
+    assert fake_k8s.core.label_selectors == ["app=api,tier=web"]
+
+
+async def test_workload_health_falls_back_when_the_pod_list_fails(fake_k8s: Any) -> None:
+    fake_k8s.deployment = _deployment(desired=3, ready=2, available=2)
+    fake_k8s.core.error = RuntimeError("pods is forbidden")
+
+    health = await get_workload_health("edge", "api")
+
+    # The deployment status is authoritative: a blind pod list must not turn a
+    # healthy deployment into a failed verification.
+    assert health["ready_pods"] == 2
+    assert health["ready"] == 2
+    assert health["desired"] == 3
+
+
+async def test_workload_health_defaults_missing_status_to_zero(fake_k8s: Any) -> None:
+    fake_k8s.deployment = _deployment(desired=2, ready=None, available=None)
+    fake_k8s.core.pods = _pods()
+
+    health = await get_workload_health("edge", "api")
+
+    assert health["ready"] == 0
+    assert health["available"] == 0
+    assert health["ready_pods"] == 0
+
+
+async def test_workload_health_error_becomes_tool_error(fake_k8s: Any) -> None:
+    error = ApiException(status=500, reason="Internal Server Error")
+    error.body = "boom from apiserver"
+    fake_k8s.read_error = error
+
+    with pytest.raises(ToolError) as failed:
+        await get_workload_health("edge", "api")
+
+    message = str(failed.value)
+    assert "deployment health read failed" in message
+    assert "boom from apiserver" in message
+
+
+async def test_workload_health_names_an_empty_error(fake_k8s: Any) -> None:
+    class SilentError(Exception):
+        def __str__(self) -> str:
+            return ""
+
+    fake_k8s.read_error = SilentError()
+
+    with pytest.raises(ToolError) as failed:
+        await get_workload_health("edge", "api")
+
+    assert "deployment health read failed" in str(failed.value)
+    assert "SilentError" in str(failed.value)
+
+
 def test_clients_are_created_lazily_from_the_cluster_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import kubernetes
 
     import tools
+
+    # The graph tests drive the real verify node, which may already have built
+    # the clients in this process. Reset the seam to model a fresh import; the
+    # assertion is about laziness, not about test ordering.
+    monkeypatch.setattr(tools, "_apps_api", None)
+    monkeypatch.setattr(tools, "_core_api", None)
 
     # Nothing is built at import: the globals are the seam tests inject into.
     assert tools._apps_api is None

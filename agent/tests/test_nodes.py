@@ -1,10 +1,10 @@
 """`nodes.py` — the pipeline stages, exercised with fakes only.
 
 Seams (module globals, monkeypatched like `routers.runs`):
-`get_blast_radius`, `get_catalog_entry`, `get_scenario`, `stop_scenario`,
-`restart_deployment`, `scale_deployment`, `diagnosis_provider`, `log_event`,
-`now`, `sleep`, `memory`, `store`. No node may call the network or wait on a
-real clock in these tests.
+`get_blast_radius`, `get_catalog_entry`, `get_scenario`, `get_workload_health`,
+`stop_scenario`, `restart_deployment`, `scale_deployment`, `diagnosis_provider`,
+`log_event`, `now`, `sleep`, `memory`, `store`. No node may call the network or
+wait on a real clock in these tests.
 """
 
 from __future__ import annotations
@@ -13,6 +13,8 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+import pytest
 
 import nodes
 from state import new_state
@@ -228,55 +230,189 @@ def _install_clock(monkeypatch: Any) -> _Clock:
     return clock
 
 
-async def test_verify_polls_until_terminal_and_computes_mttr(monkeypatch: Any) -> None:
+def _verify_state(**overrides: Any) -> Any:
+    return _state(diagnosis={"action_target": "edge/api"}, **overrides)
+
+
+def _health(
+    desired: int = 2,
+    ready: int = 2,
+    available: int | None = None,
+) -> dict[str, Any]:
+    if available is None:
+        available = ready
+    return {
+        "namespace": "edge",
+        "deployment": "api",
+        "desired": desired,
+        "ready": ready,
+        "available": available,
+        "ready_pods": ready,
+        "observed_at": "2026-11-22T12:00:00Z",
+    }
+
+
+async def test_verify_polls_until_the_workload_recovers_and_computes_mttr(
+    monkeypatch: Any,
+) -> None:
     _install_clock(monkeypatch)
-    statuses = [
+    scenarios = [
         {"id": "sc-1", "status": "running"},
         {"id": "sc-1", "status": "stopping"},
         {"id": "sc-1", "status": "stopped", "ended_at": "2026-11-22T12:01:40+00:00"},
     ]
+    health = [
+        _health(ready=0, available=0),
+        _health(ready=1, available=1),
+        _health(ready=2, available=2),
+    ]
 
     async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        return statuses.pop(0)
+        return scenarios.pop(0)
+
+    async def get_workload_health(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return health.pop(0)
 
     monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "get_workload_health", get_workload_health)
 
-    result = await nodes.verify(_state())
+    result = await nodes.verify(_verify_state())
 
-    assert result["verify_result"] in {"recovered", "stopped", "completed"}
+    assert result["verify_result"] == "recovered"
     assert result["mttr_seconds"] == 100.0
-    assert not statuses
+    assert not scenarios
+    assert not health
 
 
-async def test_verify_fails_at_the_deadline_while_still_running(monkeypatch: Any) -> None:
+async def test_verify_fails_when_the_workload_never_becomes_ready(
+    monkeypatch: Any,
+) -> None:
+    # F5 negative control: the scenario can report whatever it likes; without
+    # ready replicas the run is a failure and MTTR stays unknown.
     clock = _install_clock(monkeypatch)
-    calls: list[str] = []
+    stop_calls: list[str] = []
 
     async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {"id": "sc-1", "status": "running"}
 
+    async def get_workload_health(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return _health(desired=2, ready=0, available=0)
+
     async def stop_scenario(scenario_id: str) -> dict[str, Any]:
-        calls.append(scenario_id)
-        raise RuntimeError("stop refused")
+        stop_calls.append(scenario_id)
+        return {"id": scenario_id, "status": "stopped"}
 
     monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "get_workload_health", get_workload_health)
     monkeypatch.setattr(nodes, "stop_scenario", stop_scenario)
 
-    result = await nodes.verify(_state())
+    result = await nodes.verify(_verify_state())
 
     assert result["verify_result"] == "failed"
-    assert calls == ["sc-1"]
+    assert result["mttr_seconds"] is None
+    assert stop_calls == []
     assert clock.slept >= 55.0
 
 
-async def test_verify_survives_a_transient_read_error(monkeypatch: Any) -> None:
+async def test_verify_recovers_on_workload_health_while_the_scenario_still_runs(
+    monkeypatch: Any,
+) -> None:
+    # A scenario that is still running must not block a genuine recovery, and
+    # verify must not stop it: the run gets exactly one approved write.
+    _install_clock(monkeypatch)
+    stop_calls: list[str] = []
+    health = [_health(ready=0, available=0), _health(ready=2, available=2)]
+
+    async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"id": "sc-1", "status": "running"}
+
+    async def get_workload_health(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return health.pop(0)
+
+    async def stop_scenario(scenario_id: str) -> dict[str, Any]:
+        stop_calls.append(scenario_id)
+        return {"id": scenario_id, "status": "stopped"}
+
+    monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "get_workload_health", get_workload_health)
+    monkeypatch.setattr(nodes, "stop_scenario", stop_scenario)
+
+    result = await nodes.verify(_verify_state())
+
+    assert result["verify_result"] == "recovered"
+    assert result["mttr_seconds"] == 5.0
+    assert stop_calls == []
+    assert not health
+
+
+async def test_verify_does_not_trust_a_stopped_scenario_without_ready_replicas(
+    monkeypatch: Any,
+) -> None:
+    # Workload truth outranks the scenario document: `stopped` is not recovery.
+    clock = _install_clock(monkeypatch)
+
+    async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "id": "sc-1",
+            "status": "stopped",
+            "ended_at": "2026-11-22T12:01:40+00:00",
+        }
+
+    async def get_workload_health(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return _health(desired=2, ready=0, available=0)
+
+    monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "get_workload_health", get_workload_health)
+
+    result = await nodes.verify(_verify_state())
+
+    assert result["verify_result"] == "failed"
+    assert result["mttr_seconds"] is None
+    assert clock.slept >= 55.0
+
+
+@pytest.mark.parametrize("target", [None, "", "edge", "/api", "edge/", "edge/api/x"])
+async def test_verify_fails_closed_on_a_missing_or_malformed_target(
+    monkeypatch: Any, target: Any
+) -> None:
+    touched: list[str] = []
+
+    async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        touched.append("scenario")
+        return {}
+
+    async def get_workload_health(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        touched.append("health")
+        return _health()
+
+    monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "get_workload_health", get_workload_health)
+
+    result = await nodes.verify(_state(diagnosis={"action_target": target}))
+
+    assert result["verify_result"] == "failed"
+    assert result["mttr_seconds"] is None
+    assert touched == []
+
+
+async def test_verify_fails_closed_without_a_diagnosis(monkeypatch: Any) -> None:
+    result = await nodes.verify(_state())
+
+    assert result["verify_result"] == "failed"
+    assert result["mttr_seconds"] is None
+
+
+async def test_verify_survives_a_transient_scenario_read_error(
+    monkeypatch: Any,
+) -> None:
     # One failed read is not evidence that the system did not recover: the
     # backend can blip while the fault is being cleaned up.
     _install_clock(monkeypatch)
     responses: list[Any] = [
         RuntimeError("chaos unreachable"),
-        {"id": "sc-1", "status": "completed", "ended_at": "2026-11-22T12:01:40+00:00"},
+        {"id": "sc-1", "status": "running"},
     ]
+    health = [_health(ready=0, available=0), _health()]
 
     async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         item = responses.pop(0)
@@ -284,16 +420,71 @@ async def test_verify_survives_a_transient_read_error(monkeypatch: Any) -> None:
             raise item
         return item
 
+    async def get_workload_health(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return health.pop(0)
+
     monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "get_workload_health", get_workload_health)
 
-    result = await nodes.verify(_state())
+    result = await nodes.verify(_verify_state())
 
-    assert result["verify_result"] in {"recovered", "stopped", "completed"}
-    assert result["mttr_seconds"] == 100.0
+    assert result["verify_result"] == "recovered"
+    assert result["mttr_seconds"] == 5.0
     assert not responses
 
 
-async def test_verify_fails_at_the_deadline_naming_the_last_read_error(
+async def test_verify_survives_a_transient_health_read_error(monkeypatch: Any) -> None:
+    _install_clock(monkeypatch)
+    health: list[Any] = [RuntimeError("kube api unreachable"), _health()]
+
+    async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"id": "sc-1", "status": "running"}
+
+    async def get_workload_health(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        item = health.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "get_workload_health", get_workload_health)
+
+    result = await nodes.verify(_verify_state())
+
+    assert result["verify_result"] == "recovered"
+    assert result["mttr_seconds"] == 5.0
+    assert not health
+
+
+async def test_verify_fails_at_the_deadline_naming_the_workload_state(
+    monkeypatch: Any,
+) -> None:
+    clock = _install_clock(monkeypatch)
+    reasons: list[str] = []
+
+    async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"id": "sc-1", "status": "running"}
+
+    async def get_workload_health(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return _health(desired=2, ready=1, available=1)
+
+    def log_event(_event: str, **fields: Any) -> None:
+        reasons.append(str(fields.get("reason")))
+
+    monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "get_workload_health", get_workload_health)
+    monkeypatch.setattr(nodes, "log_event", log_event)
+
+    result = await nodes.verify(_verify_state())
+
+    assert result["verify_result"] == "failed"
+    assert 55.0 <= clock.slept <= 70.0
+    assert reasons and reasons[-1].startswith(
+        "workload not ready: 1/2 replicas after 60s"
+    )
+
+
+async def test_verify_fails_at_the_deadline_naming_the_last_read_errors(
     monkeypatch: Any,
 ) -> None:
     clock = _install_clock(monkeypatch)
@@ -302,17 +493,23 @@ async def test_verify_fails_at_the_deadline_naming_the_last_read_error(
     async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         raise RuntimeError("chaos unreachable")
 
+    async def get_workload_health(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("kube api unreachable")
+
     def log_event(_event: str, **fields: Any) -> None:
         reasons.append(str(fields.get("reason")))
 
     monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "get_workload_health", get_workload_health)
     monkeypatch.setattr(nodes, "log_event", log_event)
 
-    result = await nodes.verify(_state())
+    result = await nodes.verify(_verify_state())
 
     assert result["verify_result"] == "failed"
     assert 55.0 <= clock.slept <= 70.0
-    assert reasons and "chaos unreachable" in reasons[-1]
+    assert reasons and "workload not ready" in reasons[-1]
+    assert "kube api unreachable" in reasons[-1]
+    assert "chaos unreachable" in reasons[-1]
 
 
 async def test_report_writes_memory_and_closes_the_run_done(monkeypatch: Any) -> None:
@@ -347,54 +544,9 @@ async def test_report_writes_memory_and_closes_the_run_done(monkeypatch: Any) ->
     assert result.get("status") == "done"
 
 
-async def test_verify_stops_its_own_fault_at_the_deadline(monkeypatch: Any) -> None:
-    # A pod-kill has nothing to restore, so Chaos Mesh never reports recovery and
-    # the scenario would stay `running` forever. The fault is ours: stop it, and
-    # let the stop produce the terminal state the MTTR is measured from.
-    _install_clock(monkeypatch)
-    stopped = {"done": False}
-    calls: list[str] = []
-
-    async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        if stopped["done"]:
-            return {
-                "id": "sc-1",
-                "status": "stopped",
-                "ended_at": "2026-11-22T12:02:00+00:00",
-            }
-        return {"id": "sc-1", "status": "running"}
-
-    async def stop_scenario(scenario_id: str) -> dict[str, Any]:
-        calls.append(scenario_id)
-        stopped["done"] = True
-        return {"id": scenario_id, "status": "stopped"}
-
-    monkeypatch.setattr(nodes, "get_scenario", get_scenario)
-    monkeypatch.setattr(nodes, "stop_scenario", stop_scenario)
-
-    result = await nodes.verify(_state())
-
-    assert calls == ["sc-1"]
-    assert result["verify_result"] == "recovered"
-    assert result["mttr_seconds"] == 120.0
-
-
-async def test_verify_fails_closed_when_the_stop_does_not_help(monkeypatch: Any) -> None:
-    clock = _install_clock(monkeypatch)
-    calls: list[str] = []
-
-    async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        return {"id": "sc-1", "status": "running"}
-
-    async def stop_scenario(scenario_id: str) -> dict[str, Any]:
-        calls.append(scenario_id)
-        raise RuntimeError("chaos unreachable")
-
-    monkeypatch.setattr(nodes, "get_scenario", get_scenario)
-    monkeypatch.setattr(nodes, "stop_scenario", stop_scenario)
-
-    result = await nodes.verify(_state())
-
-    assert calls == ["sc-1"]
-    assert result["verify_result"] == "failed"
-    assert clock.slept >= 55.0
+# The two stop-at-the-deadline tests that lived here were removed by decision:
+# verify no longer stops the fault, so a test asserting the stop call would
+# contradict CONTRACT D2. The replacement is
+# `test_verify_recovers_on_workload_health_while_the_scenario_still_runs`
+# (the positive case) and `test_verify_fails_when_the_workload_never_becomes_ready`
+# (the F5 negative control).

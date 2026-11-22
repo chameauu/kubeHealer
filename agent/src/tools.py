@@ -226,3 +226,78 @@ async def scale_deployment(
         raise ToolError(f"deployment scale failed: {exc}") from exc
     return {"namespace": namespace, "deployment": name, "replicas": int(replicas)}
 
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _selector_text(selector: Any) -> str | None:
+    """Render a deployment's `matchLabels` as a `k=v,k=v` label selector."""
+    labels = getattr(selector, "match_labels", None) or {}
+    if not labels:
+        return None
+    return ",".join(f"{key}={labels[key]}" for key in sorted(labels))
+
+
+def _count_ready_pods(pods: Any) -> int:
+    """Count pods that are `Running` with a `Ready=True` condition."""
+    count = 0
+    for pod in getattr(pods, "items", None) or []:
+        status = getattr(pod, "status", None)
+        if getattr(status, "phase", None) != "Running":
+            continue
+        conditions = getattr(status, "conditions", None) or []
+        ready = any(
+            getattr(condition, "type", None) == "Ready"
+            and str(getattr(condition, "status", "")).lower() == "true"
+            for condition in conditions
+        )
+        if ready:
+            count += 1
+    return count
+
+
+async def get_workload_health(namespace: str, deployment: str) -> dict[str, Any]:
+    """Read the deployment's replica truth for verification.
+
+    The deployment status is the authoritative signal: if the pod list fails,
+    `ready_pods` falls back to `status.readyReplicas` instead of failing the
+    whole read. Only an unreadable deployment is a `ToolError`.
+    """
+    try:
+        apps_api, core_api = _api_clients()
+        document = apps_api.read_namespaced_deployment(
+            name=deployment, namespace=namespace
+        )
+        spec = getattr(document, "spec", None)
+        status = getattr(document, "status", None)
+        desired = _as_int(getattr(spec, "replicas", None))
+        ready = _as_int(getattr(status, "ready_replicas", None))
+        available = _as_int(getattr(status, "available_replicas", None))
+        try:
+            label_selector = _selector_text(getattr(spec, "selector", None))
+            if label_selector is None:
+                ready_pods = ready
+            else:
+                pods = core_api.list_namespaced_pod(
+                    namespace, label_selector=label_selector
+                )
+                ready_pods = _count_ready_pods(pods)
+        except Exception:
+            ready_pods = ready
+    except Exception as exc:
+        detail = str(exc) or exc.__class__.__name__
+        raise ToolError(f"deployment health read failed: {detail}") from exc
+    return {
+        "namespace": namespace,
+        "deployment": deployment,
+        "desired": desired,
+        "ready": ready,
+        "available": available,
+        "ready_pods": ready_pods,
+        "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
