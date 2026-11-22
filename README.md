@@ -6,9 +6,8 @@ KubeHeal injects controlled failures into Kubernetes, diagnoses them with an LLM
 behind a human approval gate, verifies that the system actually recovered, and records the MTTR
 so the next incident is cheaper than the last.
 
-This repository is at **M0**: every service answers `GET /health` with structured JSON logs and
-CORS enabled. Business logic lands service by service; the frozen decisions live in the project's
-`CONTRACT.md`.
+Every service currently exposes `GET /health` and emits one JSON log line per event; the
+service-specific endpoints described below are not implemented yet.
 
 ## Services
 
@@ -77,20 +76,6 @@ done
 
 Images are built locally as `kubeheal-<service>:latest` and imported into the cluster
 (`imagePullPolicy: Never`). Containers run as uid 1000 and expose `8080`.
-
-## Status
-
-| Milestone | Scope |
-|---|---|
-| M0 | ✅ six service skeletons, `/health`, JSON logs, CORS |
-| M1 | `sim`: resources, lifecycle, quotas, fault rules |
-| M2 | `chaos`: scenario state machine, both backends, sweeper |
-| M3 | `graph`: topology and blast radius, labelled demo mode |
-| M4 | `faultlib`: catalogue, classification, rankings |
-| M5 | `agent`: checkpointed approval pipeline, memory, MTTR |
-| M6 | dashboard: incidents + agent pages |
-| M7 | `journeys`: deterministic scenarios, safety budget |
-| M8 | cluster deployment and end-to-end run |
 
 ## Licence
 
