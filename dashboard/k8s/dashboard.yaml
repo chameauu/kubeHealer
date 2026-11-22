@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubeheal-dashboard
+  namespace: kubeheal-system
+  labels:
+    app: kubeheal-dashboard
+    app.kubernetes.io/part-of: kubeheal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubeheal-dashboard
+  template:
+    metadata:
+      labels:
+        app: kubeheal-dashboard
+        app.kubernetes.io/part-of: kubeheal
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+      containers:
+        - name: dashboard
+          image: kubeheal-dashboard:latest
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 250m, memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubeheal-dashboard
+  namespace: kubeheal-system
+  labels:
+    app.kubernetes.io/name: kubeheal-dashboard
+    app.kubernetes.io/part-of: kubeheal
+spec:
+  selector:
+    app: kubeheal-dashboard
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
