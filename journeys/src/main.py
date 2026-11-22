@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
 from events import configure_logging, log_event
+from routers import scenarios
 
 
 @asynccontextmanager
@@ -24,8 +25,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(scenarios.router)
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok", "service": settings.service_name, "version": settings.version}
+    return {
+        "status": "ok",
+        "service": settings.service_name,
+        "version": settings.version,
+        "mode": settings.mode,
+    }

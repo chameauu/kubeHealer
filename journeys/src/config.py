@@ -6,6 +6,7 @@ class Settings(BaseSettings):
 
     service_name: str = "journeys"
     version: str = "0.1.0"
+    mode: str = "cluster-free"
     log_level: str = "INFO"
     cors_origins: list[str] = ["*"]
 
