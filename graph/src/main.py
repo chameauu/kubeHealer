@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
 from events import configure_logging, log_event
+from routers import graph
 
 
 @asynccontextmanager
@@ -29,3 +30,6 @@ app.add_middleware(
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": settings.service_name, "version": settings.version}
+
+
+app.include_router(graph.router)

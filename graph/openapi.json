@@ -1,0 +1,405 @@
+{
+  "components": {
+    "schemas": {
+      "AffectedNode": {
+        "description": "A node reached by walking the dependent graph backwards.",
+        "properties": {
+          "distance_hops": {
+            "title": "Distance Hops",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "namespace": {
+            "title": "Namespace",
+            "type": "string"
+          },
+          "node_id": {
+            "title": "Node Id",
+            "type": "string"
+          },
+          "severity": {
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ],
+            "title": "Severity",
+            "type": "string"
+          },
+          "via_edge_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Via Edge Types",
+            "type": "array"
+          }
+        },
+        "required": [
+          "node_id",
+          "name",
+          "namespace",
+          "distance_hops",
+          "severity"
+        ],
+        "title": "AffectedNode",
+        "type": "object"
+      },
+      "BlastRadiusResponse": {
+        "description": "The blast radius of one fault class against one selector.",
+        "properties": {
+          "affected_nodes": {
+            "items": {
+              "$ref": "#/components/schemas/AffectedNode"
+            },
+            "title": "Affected Nodes",
+            "type": "array"
+          },
+          "computed_at": {
+            "title": "Computed At",
+            "type": "string"
+          },
+          "fault_type": {
+            "title": "Fault Type",
+            "type": "string"
+          },
+          "matched_nodes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Matched Nodes",
+            "type": "array"
+          },
+          "target_namespace": {
+            "title": "Target Namespace",
+            "type": "string"
+          },
+          "target_selector": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Target Selector",
+            "type": "object"
+          },
+          "topology_sources": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Topology Sources",
+            "type": "array"
+          }
+        },
+        "required": [
+          "target_namespace",
+          "target_selector",
+          "fault_type",
+          "matched_nodes",
+          "affected_nodes",
+          "topology_sources"
+        ],
+        "title": "BlastRadiusResponse",
+        "type": "object"
+      },
+      "Edge": {
+        "description": "A directed link from the dependent to its dependency.",
+        "properties": {
+          "edge_type": {
+            "enum": [
+              "env_ref",
+              "flow_observed"
+            ],
+            "title": "Edge Type",
+            "type": "string"
+          },
+          "env_var": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Env Var"
+          },
+          "flow_count": {
+            "default": 0,
+            "title": "Flow Count",
+            "type": "integer"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "target": {
+            "title": "Target",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "target",
+          "edge_type"
+        ],
+        "title": "Edge",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "Node": {
+        "description": "One Service in the graph. `id` is `\"<namespace>/<name>\"`.",
+        "properties": {
+          "cluster_ip": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cluster Ip"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "default": "Service",
+            "title": "Kind",
+            "type": "string"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Labels",
+            "type": "object"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "namespace": {
+            "title": "Namespace",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "namespace"
+        ],
+        "title": "Node",
+        "type": "object"
+      },
+      "TopologyResponse": {
+        "description": "The whole graph, plus the list of sources that answered.",
+        "properties": {
+          "edge_count": {
+            "title": "Edge Count",
+            "type": "integer"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            },
+            "title": "Edges",
+            "type": "array"
+          },
+          "node_count": {
+            "title": "Node Count",
+            "type": "integer"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/Node"
+            },
+            "title": "Nodes",
+            "type": "array"
+          },
+          "observed_at": {
+            "title": "Observed At",
+            "type": "string"
+          },
+          "topology_sources": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Topology Sources",
+            "type": "array"
+          }
+        },
+        "required": [
+          "nodes",
+          "edges",
+          "topology_sources",
+          "node_count",
+          "edge_count"
+        ],
+        "title": "TopologyResponse",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "graph",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/blast-radius": {
+      "get": {
+        "operationId": "get_blast_radius_blast_radius_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "target_namespace",
+            "required": true,
+            "schema": {
+              "title": "Target Namespace",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "fault_type",
+            "required": true,
+            "schema": {
+              "title": "Fault Type",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "selector",
+            "required": false,
+            "schema": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "title": "Selector",
+              "type": "array"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlastRadiusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Blast Radius",
+        "tags": [
+          "graph"
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Health Health Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health"
+      }
+    },
+    "/topology": {
+      "get": {
+        "operationId": "get_topology_topology_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopologyResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Topology",
+        "tags": [
+          "graph"
+        ]
+      }
+    }
+  }
+}
