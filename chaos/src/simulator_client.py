@@ -21,13 +21,25 @@ class SimulatorClientError(Exception):
 class SimulatorClient:
     """Small httpx wrapper around `/faults`."""
 
-    def __init__(self, base_url: str | None = None, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        base_url: str | None = None,
+        timeout: float = 10.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         self._base_url = (base_url or config.SIMULATOR_URL).rstrip("/")
         self._timeout = timeout
+        # Injected only by tests; production uses the default transport.
+        self._transport = transport
+
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=self._base_url, timeout=self._timeout, transport=self._transport
+        )
 
     async def register_fault(self, request: dict[str, Any]) -> dict[str, Any]:
         """POST /faults; the returned rule id becomes the scenario's backend_ref."""
-        async with httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout) as client:
+        async with self._client() as client:
             response = await client.post("/faults", json=request)
         if response.status_code != 201:
             raise SimulatorClientError(
@@ -37,11 +49,12 @@ class SimulatorClient:
 
     async def get_fault(self, fault_id: str) -> dict[str, Any] | None:
         """Return the rule, or None when it expired or was cleared."""
-        async with httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout) as client:
+        async with self._client() as client:
             response = await client.get(f"/faults/{fault_id}")
-            if response.status_code == 404:
-                # The simulator exposes listing rather than get-by-id; a 404
-                # on the direct path is answered by an authoritative listing.
+            if response.status_code in (404, 405):
+                # The simulator exposes listing rather than get-by-id: the route
+                # answers 405 when the path exists for DELETE only, and 404 when
+                # nothing serves it at all. Both mean "ask the listing".
                 listed = await client.get("/faults")
                 if listed.status_code != 200:
                     raise SimulatorClientError(
@@ -59,7 +72,7 @@ class SimulatorClient:
 
     async def clear_fault(self, fault_id: str) -> None:
         """DELETE /faults/{id}; clearing an absent rule is idempotent."""
-        async with httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout) as client:
+        async with self._client() as client:
             response = await client.delete(f"/faults/{fault_id}")
         if response.status_code not in (204, 404):
             raise SimulatorClientError(
