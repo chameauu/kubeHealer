@@ -18,9 +18,11 @@ metadata:
 rules:
   # The approved write path: a pod-template patch rolls a Deployment, a scale
   # patch changes its replica count. Nothing else is allowed to mutate.
+  # `list` is verification's: it resolves the faulted workload from the
+  # scenario's namespace and label selector, not from the model's answer.
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    verbs: ["get", "patch"]
+    verbs: ["get", "list", "patch"]
   - apiGroups: ["apps"]
     resources: ["deployments/scale"]
     verbs: ["get", "patch"]

@@ -187,6 +187,35 @@ def _api_clients() -> tuple[Any, Any]:
     return _apps_api, _core_api
 
 
+async def find_deployments(namespace: str, selector: dict[str, str]) -> list[str]:
+    """Sorted names of deployments whose pod template carries every selector pair.
+
+    Verification anchors on the scenario's target, so the lookup is scoped to
+    that namespace. An empty selector means "every deployment in it".
+    """
+    wanted = {str(key): str(value) for key, value in (selector or {}).items()}
+    try:
+        apps_api, _ = _api_clients()
+        listed = apps_api.list_namespaced_deployment(namespace)
+    except Exception as exc:
+        detail = str(exc) or exc.__class__.__name__
+        raise ToolError(f"deployment lookup failed: {detail}") from exc
+    names: set[str] = set()
+    for document in getattr(listed, "items", None) or []:
+        spec = getattr(document, "spec", None)
+        template = getattr(spec, "template", None)
+        metadata = getattr(template, "metadata", None)
+        labels = getattr(metadata, "labels", None)
+        if not isinstance(labels, dict):
+            labels = {}
+        if any(labels.get(key) != value for key, value in wanted.items()):
+            continue
+        name = getattr(getattr(document, "metadata", None), "name", None)
+        if name:
+            names.add(str(name))
+    return sorted(names)
+
+
 async def restart_deployment(namespace: str, name: str) -> dict[str, Any]:
     """Roll a deployment by stamping the pod template, not just the object."""
     restarted_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

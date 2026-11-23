@@ -24,6 +24,7 @@ from state import AgentState, utcnow
 from store import store
 from tools import (
     ToolError,
+    find_deployments,
     get_blast_radius,
     get_catalog_entry,
     get_scenario,
@@ -37,6 +38,9 @@ SUCCESS_VERIFY_RESULTS = frozenset({"recovered", "stopped", "completed"})
 ALLOWED_ACTIONS = frozenset({"restart_deployment", "stop_scenario", "scale_deployment"})
 POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_DOMAIN = "chaos_mesh"
+# Faults that keep degrading the workload for as long as their scenario runs.
+# Healthy replicas do not mean recovery while one of these is still active.
+DURABLE_FAULT_TYPES = frozenset({"network_latency", "packet_loss", "io_delay"})
 
 # The only fields memory may contribute to a prompt. The stored incident is a
 # whole report, scenario document included; the prompt gets the projection and
@@ -386,8 +390,8 @@ def _failed_verify(reason: str) -> dict[str, Any]:
     }
 
 
-def _workload_target(diagnosis: dict[str, Any] | None) -> tuple[str, str] | None:
-    """Split the diagnosis `action_target` (`<namespace>/<deployment>`)."""
+def _parse_action_target(diagnosis: dict[str, Any] | None) -> tuple[str, str] | None:
+    """Split a diagnosis `action_target` (`<namespace>/<deployment>`), if it is one."""
     text = str((diagnosis or {}).get("action_target") or "").strip()
     parts = text.split("/")
     if len(parts) != 2:
@@ -396,6 +400,59 @@ def _workload_target(diagnosis: dict[str, Any] | None) -> tuple[str, str] | None
     if not namespace or not deployment:
         return None
     return namespace, deployment
+
+
+def _selector_pairs(selector: Any) -> list[tuple[str, str]]:
+    if not isinstance(selector, dict):
+        return []
+    return sorted((str(key), str(value)) for key, value in selector.items())
+
+
+def _selector_text(selector: Any) -> str:
+    pairs = _selector_pairs(selector)
+    return ",".join(f"{key}={value}" for key, value in pairs) or "(all deployments)"
+
+
+async def _resolve_workload(
+    state: AgentState,
+) -> tuple[tuple[str, str] | None, str | None]:
+    """Resolve the faulted workload from the scenario, never from the model.
+
+    The scenario's namespace and label selector are the anchor: the candidates
+    are the deployments whose pod template carries every selector pair. A
+    parseable `action_target` may break a tie between candidates, and any other
+    parseable target is a scope violation. A target that is not
+    `<namespace>/<name>` (a scenario id, empty, garbage) is ignored, so the
+    fail-closed `stop_scenario` fallback still verifies.
+    """
+    scenario = state.get("scenario") or {}
+    target = scenario.get("target") or {}
+    namespace = str(target.get("namespace") or "").strip()
+    selector = target.get("label_selector") or {}
+    if not namespace:
+        return None, "no namespace in the scenario target"
+    try:
+        candidates = await find_deployments(namespace, dict(selector))
+    except Exception as exc:
+        return None, _describe_error(exc)
+    named = _parse_action_target(state.get("diagnosis"))
+    if not candidates:
+        return None, f"no deployment matches {namespace} {_selector_text(selector)}"
+    if len(candidates) == 1:
+        resolved = (namespace, candidates[0])
+    elif named is not None and named[0] == namespace and named[1] in candidates:
+        resolved = named
+    else:
+        return None, (
+            f"ambiguous workload: {namespace} {_selector_text(selector)} "
+            f"matches {', '.join(candidates)}"
+        )
+    if named is not None and named != resolved:
+        return None, (
+            f"action_target {named[0]}/{named[1]} is outside the faulted workload "
+            f"{resolved[0]}/{resolved[1]}"
+        )
+    return resolved, None
 
 
 def _workload_healthy(health: dict[str, Any]) -> bool:
@@ -407,12 +464,18 @@ def _workload_healthy(health: dict[str, Any]) -> bool:
 
 
 async def verify(state: AgentState) -> dict[str, Any]:
-    """Poll workload health; recovery is the workload's, never our own write."""
-    target = _workload_target(state.get("diagnosis"))
+    """Poll the faulted workload; recovery is the workload's, never our own write.
+
+    The workload is resolved from the scenario, so the model cannot choose what
+    "recovered" is measured against. A durable fault that is still running is
+    not recovery, however healthy the replicas look.
+    """
+    target, failure = await _resolve_workload(state)
     if target is None:
-        return _failed_verify("no workload target to verify")
+        return _failed_verify(failure or "no workload target to verify")
     namespace, deployment = target
     scenario_id = str(state.get("scenario_id") or "")
+    scenario_doc = state.get("scenario") or {}
     timeout = int(config.VERIFY_TIMEOUT_SECONDS)
     deadline = now() + timedelta(seconds=timeout)
     last_scenario_error: str | None = None
@@ -436,7 +499,13 @@ async def verify(state: AgentState) -> dict[str, Any]:
         except Exception as exc:
             health = None
             last_health_error = _describe_error(exc)
-        if health is not None and _workload_healthy(health):
+        effective = scenario or {}
+        fault_type = str(
+            effective.get("fault_type") or scenario_doc.get("fault_type") or ""
+        )
+        status = str(effective.get("status") or scenario_doc.get("status") or "")
+        durable_active = fault_type in DURABLE_FAULT_TYPES and status == "running"
+        if health is not None and _workload_healthy(health) and not durable_active:
             return {
                 "node": "verify",
                 "verify_result": "recovered",
@@ -444,6 +513,8 @@ async def verify(state: AgentState) -> dict[str, Any]:
                 "updated_at": now().isoformat(),
             }
         if now() >= deadline:
+            if durable_active:
+                return _failed_verify(f"durable fault still active: {fault_type}")
             desired = int((health or {}).get("desired") or 0)
             available = int((health or {}).get("available") or 0)
             reason = (

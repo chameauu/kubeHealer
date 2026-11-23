@@ -26,6 +26,7 @@ from kubernetes.client.exceptions import ApiException
 
 from tools import (
     ToolError,
+    find_deployments,
     get_blast_radius,
     get_catalog_entry,
     get_workload_health,
@@ -325,6 +326,73 @@ async def test_workload_health_names_an_empty_error(fake_k8s: Any) -> None:
         await get_workload_health("edge", "api")
 
     assert "deployment health read failed" in str(failed.value)
+    assert "SilentError" in str(failed.value)
+
+
+def _listed_deployment(name: str, labels: dict[str, str]) -> Any:
+    """One deployment as the list endpoint returns it: name plus pod labels."""
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name=name),
+        spec=SimpleNamespace(
+            template=SimpleNamespace(metadata=SimpleNamespace(labels=labels))
+        ),
+    )
+
+
+def _listed(*items: Any) -> Any:
+    return SimpleNamespace(items=list(items))
+
+
+async def test_find_deployments_requires_every_selector_pair(fake_k8s: Any) -> None:
+    fake_k8s.deployments = _listed(
+        _listed_deployment("api-v2", {"app": "api", "tier": "web"}),
+        _listed_deployment("worker", {"app": "api"}),
+        _listed_deployment("api-v1", {"app": "api", "tier": "web"}),
+        _listed_deployment("cron", {"tier": "web"}),
+    )
+
+    names = await find_deployments("edge", {"app": "api", "tier": "web"})
+
+    assert names == ["api-v1", "api-v2"]
+    assert fake_k8s.last().method == "LIST"
+    assert fake_k8s.last().namespace == "edge"
+
+
+async def test_find_deployments_with_an_empty_selector_returns_all(
+    fake_k8s: Any,
+) -> None:
+    fake_k8s.deployments = _listed(
+        _listed_deployment("worker", {"app": "api"}),
+        _listed_deployment("api", {"app": "api"}),
+    )
+
+    assert await find_deployments("edge", {}) == ["api", "worker"]
+
+
+async def test_find_deployments_error_becomes_tool_error(fake_k8s: Any) -> None:
+    error = ApiException(status=500, reason="Internal Server Error")
+    error.body = "boom from apiserver"
+    fake_k8s.list_error = error
+
+    with pytest.raises(ToolError) as failed:
+        await find_deployments("edge", {"app": "api"})
+
+    message = str(failed.value)
+    assert "deployment lookup failed" in message
+    assert "boom from apiserver" in message
+
+
+async def test_find_deployments_names_an_empty_error(fake_k8s: Any) -> None:
+    class SilentError(Exception):
+        def __str__(self) -> str:
+            return ""
+
+    fake_k8s.list_error = SilentError()
+
+    with pytest.raises(ToolError) as failed:
+        await find_deployments("edge", {"app": "api"})
+
+    assert "deployment lookup failed" in str(failed.value)
     assert "SilentError" in str(failed.value)
 
 

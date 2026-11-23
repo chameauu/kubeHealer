@@ -531,6 +531,20 @@ def _install_clock(monkeypatch: Any) -> _Clock:
     return clock
 
 
+def _install_deployments(
+    monkeypatch: Any, names: list[str] | tuple[str, ...] = ("api",)
+) -> list[tuple[str, dict[str, str]]]:
+    """Stand in for the cluster lookup; records what `verify` asked for."""
+    seen: list[tuple[str, dict[str, str]]] = []
+
+    async def find_deployments(namespace: str, selector: dict[str, str]) -> list[str]:
+        seen.append((namespace, dict(selector)))
+        return sorted(names)
+
+    monkeypatch.setattr(nodes, "find_deployments", find_deployments)
+    return seen
+
+
 def _verify_state(**overrides: Any) -> Any:
     return _state(diagnosis={"action_target": "edge/api"}, **overrides)
 
@@ -557,6 +571,7 @@ async def test_verify_polls_until_the_workload_recovers_and_computes_mttr(
     monkeypatch: Any,
 ) -> None:
     _install_clock(monkeypatch)
+    _install_deployments(monkeypatch)
     scenarios = [
         {"id": "sc-1", "status": "running"},
         {"id": "sc-1", "status": "stopping"},
@@ -591,6 +606,7 @@ async def test_verify_fails_when_the_workload_never_becomes_ready(
     # F5 negative control: the scenario can report whatever it likes; without
     # ready replicas the run is a failure and MTTR stays unknown.
     clock = _install_clock(monkeypatch)
+    _install_deployments(monkeypatch)
     stop_calls: list[str] = []
 
     async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
@@ -618,9 +634,10 @@ async def test_verify_fails_when_the_workload_never_becomes_ready(
 async def test_verify_recovers_on_workload_health_while_the_scenario_still_runs(
     monkeypatch: Any,
 ) -> None:
-    # A scenario that is still running must not block a genuine recovery, and
-    # verify must not stop it: the run gets exactly one approved write.
+    # A `pod_kill` scenario that is still running must not block a genuine
+    # recovery, and verify must not stop it: the run gets one approved write.
     _install_clock(monkeypatch)
+    _install_deployments(monkeypatch)
     stop_calls: list[str] = []
     health = [_health(ready=0, available=0), _health(ready=2, available=2)]
 
@@ -651,6 +668,7 @@ async def test_verify_does_not_trust_a_stopped_scenario_without_ready_replicas(
 ) -> None:
     # Workload truth outranks the scenario document: `stopped` is not recovery.
     clock = _install_clock(monkeypatch)
+    _install_deployments(monkeypatch)
 
     async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {
@@ -673,9 +691,14 @@ async def test_verify_does_not_trust_a_stopped_scenario_without_ready_replicas(
 
 
 @pytest.mark.parametrize("target", [None, "", "edge", "/api", "edge/", "edge/api/x"])
-async def test_verify_fails_closed_on_a_missing_or_malformed_target(
+async def test_verify_ignores_a_missing_or_unparseable_action_target(
     monkeypatch: Any, target: Any
 ) -> None:
+    # F9: resolution is the scenario's. An `action_target` that is not
+    # `<namespace>/<name>` — a scenario id, empty, garbage — is not evidence
+    # about which workload was faulted, so it must not block verification.
+    _install_clock(monkeypatch)
+    _install_deployments(monkeypatch)
     touched: list[str] = []
 
     async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
@@ -691,16 +714,33 @@ async def test_verify_fails_closed_on_a_missing_or_malformed_target(
 
     result = await nodes.verify(_state(diagnosis={"action_target": target}))
 
-    assert result["verify_result"] == "failed"
-    assert result["mttr_seconds"] is None
-    assert touched == []
+    assert result["verify_result"] == "recovered"
+    assert result["mttr_seconds"] is not None
+    assert touched == ["scenario", "health"]
 
 
-async def test_verify_fails_closed_without_a_diagnosis(monkeypatch: Any) -> None:
+async def test_verify_resolves_the_workload_without_a_diagnosis(
+    monkeypatch: Any,
+) -> None:
+    # F9: a fallback diagnosis carries the scenario id instead of `ns/name`;
+    # the scenario's target is what verification anchors on.
+    _install_clock(monkeypatch)
+    _install_deployments(monkeypatch)
+    health = [_health(ready=0, available=0), _health()]
+
+    async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"id": "sc-1", "status": "running"}
+
+    async def get_workload_health(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return health.pop(0)
+
+    monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "get_workload_health", get_workload_health)
+
     result = await nodes.verify(_state())
 
-    assert result["verify_result"] == "failed"
-    assert result["mttr_seconds"] is None
+    assert result["verify_result"] == "recovered"
+    assert result["mttr_seconds"] == 5.0
 
 
 async def test_verify_survives_a_transient_scenario_read_error(
@@ -709,6 +749,7 @@ async def test_verify_survives_a_transient_scenario_read_error(
     # One failed read is not evidence that the system did not recover: the
     # backend can blip while the fault is being cleaned up.
     _install_clock(monkeypatch)
+    _install_deployments(monkeypatch)
     responses: list[Any] = [
         RuntimeError("chaos unreachable"),
         {"id": "sc-1", "status": "running"},
@@ -736,6 +777,7 @@ async def test_verify_survives_a_transient_scenario_read_error(
 
 async def test_verify_survives_a_transient_health_read_error(monkeypatch: Any) -> None:
     _install_clock(monkeypatch)
+    _install_deployments(monkeypatch)
     health: list[Any] = [RuntimeError("kube api unreachable"), _health()]
 
     async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
@@ -762,6 +804,7 @@ async def test_verify_fails_at_the_deadline_naming_the_workload_state(
 ) -> None:
     clock = _install_clock(monkeypatch)
     reasons: list[str] = []
+    _install_deployments(monkeypatch)
 
     async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {"id": "sc-1", "status": "running"}
@@ -790,6 +833,7 @@ async def test_verify_fails_at_the_deadline_naming_the_last_read_errors(
 ) -> None:
     clock = _install_clock(monkeypatch)
     reasons: list[str] = []
+    _install_deployments(monkeypatch)
 
     async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         raise RuntimeError("chaos unreachable")
@@ -811,6 +855,167 @@ async def test_verify_fails_at_the_deadline_naming_the_last_read_errors(
     assert reasons and "workload not ready" in reasons[-1]
     assert "kube api unreachable" in reasons[-1]
     assert "chaos unreachable" in reasons[-1]
+
+
+async def test_verify_resolves_the_workload_from_the_scenario_not_the_model(
+    monkeypatch: Any,
+) -> None:
+    # F7 regression: the model naming any healthy deployment must not turn the
+    # run into `recovered`. The scenario says which workload was faulted.
+    _install_clock(monkeypatch)
+    seen = _install_deployments(monkeypatch, ["demo-target"])
+    reasons: list[str] = []
+    health_calls: list[tuple[str, str]] = []
+    scenario = {
+        **SCENARIO,
+        "target": {"namespace": "edge", "label_selector": {"app": "demo-target"}},
+    }
+
+    async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"id": "sc-1", "status": "running"}
+
+    async def get_workload_health(namespace: str, deployment: str) -> dict[str, Any]:
+        health_calls.append((namespace, deployment))
+        return _health()
+
+    def log_event(_event: str, **fields: Any) -> None:
+        reasons.append(str(fields.get("reason")))
+
+    monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "get_workload_health", get_workload_health)
+    monkeypatch.setattr(nodes, "log_event", log_event)
+
+    result = await nodes.verify(
+        _state(scenario=scenario, diagnosis={"action_target": "edge/other-healthy"})
+    )
+
+    assert result["verify_result"] == "failed"
+    assert result["mttr_seconds"] is None
+    assert seen == [("edge", {"app": "demo-target"})]
+    assert health_calls == [], "the healthy wrong deployment must never be read as recovery"
+    assert len(reasons) == 1
+    assert "action_target edge/other-healthy" in reasons[0]
+    assert "outside the faulted workload edge/demo-target" in reasons[0]
+
+
+async def test_verify_resolves_the_workload_when_action_target_is_the_scenario_id(
+    monkeypatch: Any,
+) -> None:
+    # F9 regression: the fail-closed fallback recommends `stop_scenario` with
+    # the scenario id as its target. Verification must still anchor on the
+    # scenario's workload and record a verdict instead of `error`/`None`.
+    _install_clock(monkeypatch)
+    seen = _install_deployments(monkeypatch)
+    health = [_health(ready=0, available=0), _health()]
+
+    async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"id": "sc-1", "status": "running"}
+
+    async def get_workload_health(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return health.pop(0)
+
+    monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "get_workload_health", get_workload_health)
+
+    result = await nodes.verify(_state(diagnosis={"action_target": "sc-1"}))
+
+    assert result["verify_result"] == "recovered"
+    assert result["mttr_seconds"] == 5.0
+    assert seen == [("edge", {"app": "api"})]
+
+
+async def test_verify_fails_closed_when_no_deployment_matches_the_selector(
+    monkeypatch: Any,
+) -> None:
+    _install_clock(monkeypatch)
+    _install_deployments(monkeypatch, [])
+    reasons: list[str] = []
+
+    def log_event(_event: str, **fields: Any) -> None:
+        reasons.append(str(fields.get("reason")))
+
+    monkeypatch.setattr(nodes, "log_event", log_event)
+
+    result = await nodes.verify(_verify_state())
+
+    assert result["verify_result"] == "failed"
+    assert result["mttr_seconds"] is None
+    assert reasons[-1] == "no deployment matches edge app=api"
+
+
+async def test_verify_fails_closed_on_an_ambiguous_selector(monkeypatch: Any) -> None:
+    _install_clock(monkeypatch)
+    _install_deployments(monkeypatch, ["api-v2", "api-v1"])
+    reasons: list[str] = []
+
+    def log_event(_event: str, **fields: Any) -> None:
+        reasons.append(str(fields.get("reason")))
+
+    monkeypatch.setattr(nodes, "log_event", log_event)
+
+    result = await nodes.verify(
+        _state(diagnosis={"action_target": "edge/other-healthy"})
+    )
+
+    assert result["verify_result"] == "failed"
+    assert result["mttr_seconds"] is None
+    assert "ambiguous workload: edge app=api matches api-v1, api-v2" in reasons[-1]
+
+
+async def test_verify_prefers_the_named_deployment_when_the_selector_is_ambiguous(
+    monkeypatch: Any,
+) -> None:
+    _install_clock(monkeypatch)
+    _install_deployments(monkeypatch, ["api-v1", "api-v2"])
+    health_calls: list[tuple[str, str]] = []
+
+    async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"id": "sc-1", "status": "running"}
+
+    async def get_workload_health(namespace: str, deployment: str) -> dict[str, Any]:
+        health_calls.append((namespace, deployment))
+        return _health()
+
+    monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "get_workload_health", get_workload_health)
+
+    result = await nodes.verify(
+        _state(diagnosis={"action_target": "edge/api-v2"})
+    )
+
+    assert result["verify_result"] == "recovered"
+    assert health_calls == [("edge", "api-v2")]
+
+
+async def test_verify_fails_when_a_durable_fault_is_still_active(
+    monkeypatch: Any,
+) -> None:
+    # `network_latency` keeps degrading traffic while its scenario runs, so a
+    # healthy replica count is not recovery.
+    clock = _install_clock(monkeypatch)
+    _install_deployments(monkeypatch)
+    reasons: list[str] = []
+    scenario = {**SCENARIO, "fault_type": "network_latency"}
+
+    async def get_scenario(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"id": "sc-1", "status": "running", "fault_type": "network_latency"}
+
+    async def get_workload_health(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return _health()
+
+    def log_event(_event: str, **fields: Any) -> None:
+        reasons.append(str(fields.get("reason")))
+
+    monkeypatch.setattr(nodes, "get_scenario", get_scenario)
+    monkeypatch.setattr(nodes, "get_workload_health", get_workload_health)
+    monkeypatch.setattr(nodes, "log_event", log_event)
+
+    result = await nodes.verify(_state(scenario=scenario))
+
+    assert result["verify_result"] == "failed"
+    assert result["mttr_seconds"] is None
+    assert 55.0 <= clock.slept <= 70.0
+    assert reasons[-1] == "durable fault still active: network_latency"
 
 
 async def test_report_writes_memory_and_closes_the_run_done(monkeypatch: Any) -> None:

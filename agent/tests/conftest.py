@@ -216,6 +216,8 @@ class FakeAppsApi:
         self.error: Exception | None = None
         self.deployment: Any = None
         self.read_error: Exception | None = None
+        self.deployments: Any = None
+        self.list_error: Exception | None = None
 
     def _record(self, method: str, name: str, namespace: str, body: Any) -> Any:
         if self.error is not None:
@@ -240,6 +242,12 @@ class FakeAppsApi:
             raise self.read_error
         self.calls.append(K8sCall("GET", name, namespace, None))
         return self.deployment
+
+    def list_namespaced_deployment(self, namespace: str, **_kwargs: Any) -> Any:
+        self.calls.append(K8sCall("LIST", "deployments", namespace, None))
+        if self.list_error is not None:
+            raise self.list_error
+        return self.deployments
 
     def last(self) -> K8sCall:
         assert self.calls, "the tool issued no Kubernetes call"
