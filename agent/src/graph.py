@@ -110,7 +110,10 @@ def _approve(state: AgentState) -> dict[str, Any]:
             "type": "approval_required",
             "scenario_id": state["scenario_id"],
             "diagnosis": state["diagnosis"],
-            "risk": (state["diagnosis"] or {}).get("risk"),
+            # The effective risk, not the proposal: the human approves what will
+            # actually run. The raw proposal stays visible inside `diagnosis`.
+            "risk": state.get("risk"),
+            "risk_policy": state.get("risk_policy"),
         }
     )
     if not isinstance(decision, dict):

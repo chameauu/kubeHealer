@@ -4,6 +4,11 @@ Every key here is part of the contract: `GET /runs/{id}` serialises this
 document, and the sweeper and the resume endpoint read `approval_status`,
 `approval_reason`, `node` and `updated_at`. Adding a key means amending
 `CONTRACT.md` first.
+
+`risk` and `risk_policy` are the exception that proves the rule: they record the
+decision `policy.py` made — the effective risk and why it is what it is — and
+they need the dated D2 amendment entry that the freeze requires before they can
+be treated as frozen.
 """
 
 from datetime import datetime, timezone
@@ -17,6 +22,8 @@ class AgentState(TypedDict):
     catalog_entry: dict[str, Any] | None
     memory_context: str | None
     diagnosis: dict[str, Any] | None
+    risk: str | None  # effective risk, decided by `policy`, not by the diagnosis
+    risk_policy: dict[str, Any] | None  # proposed vs minimum vs effective, and why
     approval_status: str  # not_required | pending | approved | rejected
     approval_reason: str | None  # "timeout" | "operator" | "policy"
     action_result: str | None
@@ -43,6 +50,8 @@ def new_state(scenario_id: str, scenario: dict[str, Any]) -> AgentState:
         catalog_entry=None,
         memory_context=None,
         diagnosis=None,
+        risk=None,
+        risk_policy=None,
         approval_status="not_required",
         approval_reason=None,
         action_result=None,

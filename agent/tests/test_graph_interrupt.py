@@ -22,7 +22,13 @@ SCENARIO = {
 }
 
 
-def _make(path, *, risk: str = "high", calls: list[str] | None = None):
+def _make(
+    path,
+    *,
+    risk: str = "high",
+    action: str = "restart_deployment",
+    calls: list[str] | None = None,
+):
     calls = [] if calls is None else calls
 
     def execute(_state) -> str:
@@ -33,7 +39,7 @@ def _make(path, *, risk: str = "high", calls: list[str] | None = None):
         checkpointer=SqliteSaver(sqlite3.connect(str(path), check_same_thread=False)),
         diagnosis_provider=lambda **_: {
             "causal_chain": ["pod terminated", "no ready replicas"],
-            "recommended_action": "restart_deployment",
+            "recommended_action": action,
             "action_target": "edge/api",
             "risk": risk,
             "rationale": "test",
@@ -88,7 +94,11 @@ def test_timeout_sweep_aborts_and_never_executes(tmp_path):
 
 def test_approve_after_execute_started_is_rejected(tmp_path):
     db = tmp_path / "checkpoints.db"
-    graph, calls = _make(db, risk="low")
+    # Adapted for F2: `restart_deployment` carries a `medium` floor, so a `low`
+    # proposal can no longer skip the interrupt. This test is about a second
+    # resume after execution, not about the gate, so it uses the one action that
+    # legitimately auto-executes on a `low` proposal.
+    graph, calls = _make(db, risk="low", action="stop_scenario")
 
     done = start_run(graph, "sc-1", SCENARIO)
 

@@ -160,9 +160,70 @@ async def test_heal_plan_requires_approval_for_high_and_medium(
 async def test_heal_plan_declares_low_risk_not_required(monkeypatch: Any) -> None:
     monkeypatch.setattr(nodes, "log_event", lambda *_args, **_kwargs: None)
 
-    result = await nodes.heal_plan(_state(diagnosis={**DIAGNOSIS, "risk": "low"}))
+    # Adapted for F2: `stop_scenario` is the one action whose policy floor is
+    # `low`, so it is the only action that can still auto-execute on a `low`
+    # proposal. The old body used `restart_deployment` with `risk: low`, which
+    # encoded the pass-through bug itself and must not be asserted any more.
+    result = await nodes.heal_plan(
+        _state(diagnosis={**DIAGNOSIS, "recommended_action": "stop_scenario", "risk": "low"})
+    )
 
     assert result["approval_status"] == "not_required"
+    assert result["risk"] == "low"
+
+
+async def test_heal_plan_escalates_a_low_proposed_restart_to_medium(
+    monkeypatch: Any,
+) -> None:
+    # The F2 regression: a model that says `low` for a disruptive action must
+    # not authorise itself. Before the policy module this returned `not_required`.
+    monkeypatch.setattr(nodes, "log_event", lambda *_args, **_kwargs: None)
+
+    result = await nodes.heal_plan(
+        _state(diagnosis={**DIAGNOSIS, "recommended_action": "restart_deployment", "risk": "low"})
+    )
+
+    assert result["approval_status"] == "pending"
+    assert result["risk"] == "medium"
+
+
+async def test_heal_plan_escalates_a_low_proposed_scale_to_high(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(nodes, "log_event", lambda *_args, **_kwargs: None)
+
+    result = await nodes.heal_plan(
+        _state(diagnosis={**DIAGNOSIS, "recommended_action": "scale_deployment", "risk": "low"})
+    )
+
+    assert result["approval_status"] == "pending"
+    assert result["risk"] == "high"
+
+
+async def test_heal_plan_records_why_the_risk_was_raised(monkeypatch: Any) -> None:
+    monkeypatch.setattr(nodes, "log_event", lambda *_args, **_kwargs: None)
+
+    result = await nodes.heal_plan(
+        _state(diagnosis={**DIAGNOSIS, "recommended_action": "restart_deployment", "risk": "low"})
+    )
+
+    assert result["risk_policy"] == {
+        "proposed_risk": "low",
+        "effective_risk": "medium",
+        "minimum_risk": "medium",
+        "raised": True,
+    }
+
+
+async def test_heal_plan_fails_closed_on_an_unknown_action(monkeypatch: Any) -> None:
+    monkeypatch.setattr(nodes, "log_event", lambda *_args, **_kwargs: None)
+
+    result = await nodes.heal_plan(
+        _state(diagnosis={**DIAGNOSIS, "recommended_action": "delete_everything", "risk": "low"})
+    )
+
+    assert result["approval_status"] == "pending"
+    assert result["risk"] == "high"
 
 
 async def test_heal_plan_emits_the_pending_event(monkeypatch: Any) -> None:
@@ -173,6 +234,24 @@ async def test_heal_plan_emits_the_pending_event(monkeypatch: Any) -> None:
 
     assert calls
     assert any("kubeheal|sc-1|heal_plan" in repr(call) for call in calls)
+
+
+async def test_heal_plan_publishes_the_effective_risk_the_human_approves(
+    monkeypatch: Any,
+) -> None:
+    calls: list[tuple[Any, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        nodes, "log_event", lambda *args, **kwargs: calls.append((args, kwargs))
+    )
+
+    await nodes.heal_plan(
+        _state(diagnosis={**DIAGNOSIS, "recommended_action": "restart_deployment", "risk": "low"})
+    )
+
+    _, fields = calls[-1]
+    assert fields["risk"] == "medium"
+    assert fields["proposed_risk"] == "low"
+    assert fields["approval_status"] == "pending"
 
 
 async def test_execute_refuses_an_unknown_action(monkeypatch: Any) -> None:

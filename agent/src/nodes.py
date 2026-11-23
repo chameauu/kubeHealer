@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 import providers
+import policy
 from config import config
 from events import log_event
 from memory import memory
@@ -197,22 +198,32 @@ async def diagnose(
 
 
 async def heal_plan(state: AgentState) -> dict[str, Any]:
-    """High and medium risk park for approval; low risk executes directly."""
+    """The policy table decides the risk and the gate; the diagnosis only proposes."""
     scenario_id = state.get("scenario_id")
     diagnosis = state.get("diagnosis") or {}
-    risk = str(diagnosis.get("risk") or "high").lower()
-    requires_approval = risk in {"high", "medium"}
-    status = "pending" if requires_approval else "not_required"
+    action = diagnosis.get("recommended_action")
+    proposed = diagnosis.get("risk")
+    risk = policy.effective_risk(action, proposed)
+    approval_required = policy.requires_approval(risk)
+    status = "pending" if approval_required else "not_required"
+    risk_policy = policy.explain(action, proposed)
     log_event(
-        f"kubeheal|{scenario_id}|heal_plan|{'approval_required' if requires_approval else 'auto'}",
+        f"kubeheal|{scenario_id}|heal_plan|"
+        f"{'approval_required' if approval_required else 'auto'}",
         scenario_id=scenario_id,
+        # The effective risk is what the human is asked to accept, and what
+        # `execute` may act on: the proposal is recorded beside it, never instead.
         risk=risk,
+        proposed_risk=risk_policy["proposed_risk"],
+        risk_raised=risk_policy["raised"],
         approval_status=status,
-        action=diagnosis.get("recommended_action"),
+        action=action,
     )
     return {
         "node": "heal_plan",
         "approval_status": status,
+        "risk": risk,
+        "risk_policy": risk_policy,
         "updated_at": utcnow(),
     }
 
@@ -408,6 +419,8 @@ async def report(state: AgentState) -> dict[str, Any]:
         "status": status,
         "node": "report",
         "approval_status": state.get("approval_status"),
+        "risk": state.get("risk"),
+        "risk_policy": state.get("risk_policy"),
         "verify_result": state.get("verify_result"),
         "action_result": state.get("action_result"),
         "mttr_seconds": mttr,
