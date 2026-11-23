@@ -1,48 +1,88 @@
 {
-  "captured_from": "authored_fixture",
-  "model": null,
+  "17676bd0ecc1445fca5d77cb3f78640bac3d0f9fe0f4072462a7d0c934997087": {
+    "action_target": "kubeheal-system/demo-target",
+    "causal_chain": [
+      "PodChaos pod_kill deletes one pod of demo-target in kubeheal-system",
+      "ReplicaSet detects missing pod and creates a replacement pod",
+      "Replacement pod starts and registers endpoints",
+      "In-flight requests to killed pod fail until replacement is ready"
+    ],
+    "rationale": "Restarting the deployment clears failed endpoints and restores stable service after pod kill induced transient failures.",
+    "recommended_action": "restart_deployment",
+    "risk": "medium"
+  },
+  "453cec9a4741e2e40924dda9246e8af61211bb802d0879fbe8b7302e2cfc99dc": {
+    "action_target": "kubeheal-system/demo-target",
+    "causal_chain": [
+      "PodChaos pod_kill deletes one pod of kubeheal-system/demo-target",
+      "ReplicaSet recreates the pod",
+      "In-flight requests to the killed pod fail immediately",
+      "Endpoints list briefly missing one address causes connection errors",
+      "New pod becomes ready and endpoints are repopulated",
+      "Service recovers after short disruption"
+    ],
+    "rationale": "Restarting the deployment clears failed endpoints and resolves connection errors caused by the pod kill, as confirmed by past incident success and medium risk level.",
+    "recommended_action": "restart_deployment",
+    "risk": "medium"
+  },
+  "captured_from": "azure_foundry",
   "demo_payload": {
-    "scenario": {
-      "id": "sc-demo-pod-kill",
-      "fault_type": "pod_kill",
-      "domain": "chaos_mesh",
-      "status": "running",
-      "target": {
-        "namespace": "edge",
-        "label_selector": {
-          "app": "api"
-        }
-      },
-      "started_at": "2026-11-22T12:00:00+00:00"
-    },
     "blast_radius": {
-      "target_namespace": "edge",
-      "affected_nodes": [
-        {
-          "node_id": "edge/api",
-          "distance_hops": 0
-        }
+      "affected_nodes": [],
+      "computed_at": "2026-11-23T14:12:34.748Z",
+      "fault_type": "pod_kill",
+      "matched_nodes": [
+        "kubeheal-system/demo-target"
       ],
+      "target_namespace": "kubeheal-system",
+      "target_selector": {
+        "app": "demo-target"
+      },
       "topology_sources": [
-        "synthetic_fixture"
+        "kubernetes"
       ]
     },
     "catalog_entry": {
+      "authored": true,
+      "blast_radius_shape": "single_pod",
+      "category_rationale": "the failure is local but propagates to every caller for the duration of the restart, which is the defining property of a cascade rather than an isolated fault.",
+      "description": "One pod disappears without warning. In-flight requests on that pod fail immediately, the ReplicaSet schedules a replacement, and callers see a short burst of connection errors followed by recovery once the new pod is ready and endpoints are repopulated.",
       "domain": "chaos_mesh",
       "fault_type": "pod_kill",
-      "blast_radius": "single_deployment"
+      "mechanism": "`PodChaos{action: pod-kill}` deletes the selected pod(s); the ReplicaSet recreates them.",
+      "taxonomy_category": "cascading",
+      "typical_symptoms": [
+        "connection refused or reset from a single endpoint",
+        "HTTP 502/503 spikes while the replacement starts",
+        "pod restart count increment",
+        "endpoints list briefly missing one address"
+      ]
     },
-    "memory_context": null
+    "memory_context": null,
+    "scenario": {
+      "backend_ref": "kubeheal-chaos-scn-6d8b31ba7a",
+      "correlation_id": null,
+      "created_at": "2026-11-23T14:12:23.432Z",
+      "domain": "chaos_mesh",
+      "duration_seconds": 20.0,
+      "ended_at": null,
+      "error": null,
+      "fault_type": "pod_kill",
+      "id": "scn-6d8b31ba7a",
+      "live_status": null,
+      "name": "e2e-pod-kill",
+      "params": {},
+      "started_at": "2026-11-23T14:12:23.450Z",
+      "status": "running",
+      "target": {
+        "label_selector": {
+          "app": "demo-target"
+        },
+        "mode": "one",
+        "namespace": "kubeheal-system",
+        "value": null
+      }
+    }
   },
-  "3bb49d480602ce27166670358c957905acff392912403d5d6e4466627eb2dd51": {
-    "causal_chain": [
-      "pod terminated",
-      "no ready replicas",
-      "downstream 503s"
-    ],
-    "recommended_action": "restart_deployment",
-    "action_target": "edge/api",
-    "risk": "high",
-    "rationale": "the deployment has no ready replicas; a restart restores capacity"
-  }
+  "model": "gpt-4.1-mini"
 }

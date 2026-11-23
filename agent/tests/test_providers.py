@@ -660,9 +660,11 @@ async def test_default_diagnose_honours_cassette_mode(
 
     diagnosis = result["diagnosis"]
     assert diagnosis["recommended_action"] == "restart_deployment"
+    # The shipped demo cassette is recorded from a live Foundry call, so it
+    # declares the model it came from instead of leaving it null.
     assert diagnosis["diagnosis_provenance"] == {
         "mode": "cassette",
-        "model": None,
+        "model": FOUNDRY_MODEL,
         "prompt_sha256": providers.prompt_sha256(payload),
     }
 
