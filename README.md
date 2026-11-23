@@ -7,8 +7,10 @@ human to approve it, executes it, and then **checks whether the workload actuall
 records the MTTR so the next incident is cheaper than the last.
 
 The point of the project is the part most demos skip: recovery is verified against the workload
-(ready replicas, ready pods), not against the agent's own bookkeeping. A run whose workload never
-recovers ends `failed` with no MTTR, and that path is tested.
+(ready replicas, ready pods) that the *scenario* faulted — not the deployment the model named, and not
+the agent's own bookkeeping. A durable fault (network or IO chaos) is never reported as recovered while
+it is still running. A run whose workload never comes back ends with status `error`, outcome `failed`
+and no MTTR, and that path is tested.
 
 ## What it does
 
@@ -34,8 +36,9 @@ dashboard ──/api/*──► graph :8080 · faultlib :8081 · chaos :8082 · 
   because the workload is what matters.
 - **Incident memory.** The 20 most recent incidents per fault type feed the next diagnosis, with
   success rate, confidence (aborted runs excluded) and mean MTTR.
-- **A console.** `dashboard/` renders the incident list, the injection form, live topology, approval,
-  the diagnosis with its provenance, and memory.
+- **A console.** `dashboard/` renders the incident list with live injection, and the agent workspace
+  with approval, the diagnosis and its provenance, and memory. Topology, overview, chaos lab and fault
+  library are explicit placeholders that say so rather than showing invented data.
 
 ## Services
 
@@ -48,9 +51,11 @@ dashboard ──/api/*──► graph :8080 · faultlib :8081 · chaos :8082 · 
 | `agent/` | 8084 | 8080 | Detect → diagnose → heal_plan → approve → execute → verify → report. |
 | `journeys/` | 8004 | 8080 | Deterministic, cluster-free resilience model. |
 
-Each service is standalone: `src/main.py`, `src/config.py`, `src/events.py`, `src/models.py`,
-`tests/`, `requirements.txt`, `Dockerfile`, `k8s/`, and a committed `openapi.json`. There is no shared
-package — duplicated conventions and explicit HTTP contracts instead.
+Each service is standalone: `src/main.py`, `src/config.py`, `src/events.py`, `tests/`,
+`requirements.txt`, `Dockerfile`, `k8s/`, and a committed `openapi.json`. The module set follows what
+the service needs — `models.py` for the services with a typed domain, `routers/` for the ones with HTTP
+routes, and `agent/` has neither because its contracts live in `state.py` and `routers/runs.py`. There is
+no shared package — duplicated conventions and explicit HTTP contracts instead.
 
 ## Run it on minikube
 
@@ -113,12 +118,15 @@ Unit tests need no cluster, no Chaos Mesh and no API key.
 | `openai` | a live call to the OpenAI API; needs `OPENAI_API_KEY` |
 
 `LLM_*` settings are read from the environment, or from a `.env` at the repository root, which is
-gitignored. In a cluster the key belongs in a Secret (`kubeheal-llm`), never in a manifest.
+gitignored. It holds a live key on a developer machine and is never committed. In a cluster the key
+belongs in a Secret (`kubeheal-llm`), never in a manifest.
 
 Every run records `diagnosis_provenance` (`mode`, `model`, `prompt_sha256`), so a report can never
 claim a judgement it did not make. The unit tests never call a model provider: `conftest.py` clears
-`LLM_PROVIDER`, `LLM_BASE_URL` and `LLM_API_KEY`, so the suite stays on `stub`. The cassette shipped
-in `agent/fixtures/` is **authored**, and says so (`captured_from: authored_fixture`).
+`LLM_PROVIDER`, `LLM_BASE_URL` and `LLM_API_KEY`, so the suite stays on `stub`. The cassette shipped in
+`agent/fixtures/` was **recorded** from live Azure Foundry calls (`captured_from: azure_foundry`, model
+`gpt-4.1-mini`) for two real run payloads; a cassette miss raises rather than falling back, so a replay
+can only succeed for evidence that was actually diagnosed.
 
 ## What is synthetic
 
