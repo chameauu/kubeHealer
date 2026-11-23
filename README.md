@@ -144,6 +144,23 @@ port-forward on a cluster you own. The write path is one approved action per run
 accounts are limited to the three fault CRDs, deployment patches, and read-only topology. Do not expose
 it publicly.
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main` and on every pull request:
+
+- each of the six services on Python 3.11, with its own `requirements.txt` and `pytest.ini`;
+- the console, via `npm ci && npm run build` (which typechecks before it bundles);
+- the same pre-commit hooks a developer runs locally, so CI and the working copy are one gate.
+
+```bash
+pre-commit install     # once per clone
+pre-commit run --all-files
+```
+
+The hooks are check-only: multi-document YAML is allowed because the Kubernetes manifests need it,
+syntax and undefined-name errors fail, nothing in the service trees may name the upstream project,
+and `.env` can never be committed.
+
 ## Licence
 
 Apache-2.0. See `LICENSE` and `NOTICE`.

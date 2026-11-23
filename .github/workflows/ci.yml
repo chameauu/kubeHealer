@@ -1,0 +1,80 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  service:
+    name: ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [sim, chaos, graph, faultlib, agent, journeys]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.service }}
+        run: |
+          uv venv .venv --python 3.11
+          uv pip install --python .venv/bin/python -r requirements.txt
+
+      - name: Unit and contract tests
+        working-directory: ${{ matrix.service }}
+        # Each service carries its own pytest.ini (pythonpath=src,
+        # asyncio_mode=auto), so the suite runs from its own directory and
+        # touches no other service. No cluster, no Chaos Mesh, no API key:
+        # the agent suite pins the live provider names empty in conftest.
+        run: .venv/bin/python -m pytest -q
+
+  dashboard:
+    name: dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Install
+        working-directory: dashboard
+        run: npm ci
+
+      - name: Type-check and build
+        working-directory: dashboard
+        run: npm run build
+
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pre-commit
+        run: python -m pip install --quiet pre-commit
+
+      # One source of truth: the same hooks run locally and here, so a green
+      # local run means a green CI run for this job.
+      - name: Run hooks
+        run: pre-commit run --all-files --show-diff-on-failure

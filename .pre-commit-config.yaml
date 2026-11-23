@@ -1,0 +1,49 @@
+# Local quality gates, mirrored by .github/workflows/ci.yml.
+#
+# Deliberately check-only: no formatting or whitespace rewriters run over the
+# existing tree, because a hook that rewrites files turns every commit into a
+# reformat and hides the real change. Style is not policed here; correctness
+# and the shipping rules are.
+
+default_language_version:
+  python: python3.11
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-yaml
+        # Kubernetes manifests are multi-document; without this the hook reads
+        # the second `---` block as a syntax error.
+        args: [--allow-multiple-documents]
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.6
+    hooks:
+      - id: ruff
+        # Syntax and name errors only. A broader rule set would demand a
+        # reformat of working code, which this change does not include.
+        args: [--select, "E9,F63,F7,F82", --no-fix]
+
+  - repo: local
+    hooks:
+      - id: no-upstream-references
+        name: shipped trees name no upstream project
+        # NOTICE is the only file allowed to name it; these paths are what a
+        # reader actually runs.
+        entry: bash -c 'if grep -rin phoenix sim chaos graph faultlib agent journeys dashboard/src k8s; then echo "remove the upstream reference"; exit 1; fi'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: no-committed-env
+        name: .env is never committed
+        entry: bash -c 'if git ls-files --error-unmatch .env >/dev/null 2>&1; then echo ".env holds a live key and must stay untracked"; exit 1; fi'
+        language: system
+        pass_filenames: false
+        always_run: true
