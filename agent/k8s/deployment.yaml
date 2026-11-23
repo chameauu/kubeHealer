@@ -42,9 +42,12 @@ spec:
             # to the working directory, /app.
             - name: AGENT_CASSETTE_PATH
               value: fixtures/diagnosis-cassette.json
-            # LLM_MODE=stub needs no key. LLM_MODE=cassette replays the authored
-            # cassette offline. LLM_MODE=openai requires the OPENAI_API_KEY
-            # secret, which is never committed to the repository.
+            # Offline default: the stub needs no key, so the image starts even
+            # when no secret exists. A cluster that wants live diagnosis supplies
+            # the kubeheal-llm secret below; its LLM_PROVIDER (for example
+            # azure-v1) takes precedence over this value. Base URL, model and key
+            # travel together in that secret, so no tenant endpoint or credential
+            # is ever committed here.
             - name: LLM_MODE
               value: stub
             - name: GRAPH_URL
@@ -53,6 +56,10 @@ spec:
               value: http://kubeheal-faultlib.kubeheal-system.svc.cluster.local
             - name: CHAOS_URL
               value: http://kubeheal-chaos.kubeheal-system.svc.cluster.local
+          envFrom:
+            - secretRef:
+                name: kubeheal-llm
+                optional: true
           volumeMounts:
             - name: data
               mountPath: /data

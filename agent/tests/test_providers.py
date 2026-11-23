@@ -267,6 +267,242 @@ def test_providers_module_imports_with_openai_absent(
     assert "openai" not in sys.modules
 
 
+# --- azure ai foundry (OpenAI-compatible v1) ------------------------------
+
+FOUNDRY_VARS = (
+    "LLM_PROVIDER",
+    "LLM_BASE_URL",
+    "LLM_API_KEY",
+    "LLM_MODEL",
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_DEPLOYMENT",
+)
+FOUNDRY_BASE_URL = "https://kamelcv.services.ai.azure.com/openai/v1"
+FOUNDRY_MODEL = "gpt-4.1-mini"
+
+
+@pytest.fixture
+def foundry_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """Clean settings, then the LLM_* names the service really uses."""
+    for name in FOUNDRY_VARS:
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.setattr(runtime_config, name, "", raising=False)
+    monkeypatch.setenv("LLM_PROVIDER", "azure-v1")
+    monkeypatch.setenv("LLM_BASE_URL", FOUNDRY_BASE_URL)
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_MODEL", FOUNDRY_MODEL)
+    return {
+        "base_url": FOUNDRY_BASE_URL,
+        "api_key": "test-key",
+        "model": FOUNDRY_MODEL,
+    }
+
+
+class _FakeFoundryClient:
+    """The slice of the OpenAI client the provider touches, recording calls."""
+
+    def __init__(self, content: Any) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.content = content
+        self.chat = SimpleNamespace(
+            completions=SimpleNamespace(create=self._create)
+        )
+
+    def _create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        message = SimpleNamespace(content=self.content)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+def _install_fake_foundry(
+    monkeypatch: pytest.MonkeyPatch, content: Any = json.dumps(DIAGNOSIS)
+) -> tuple[_FakeFoundryClient, dict[str, Any]]:
+    """Install the client seam; return the client and the factory's kwargs."""
+    client = _FakeFoundryClient(content)
+    factory_kwargs: dict[str, Any] = {}
+
+    def factory(**kwargs: Any) -> _FakeFoundryClient:
+        factory_kwargs.update(kwargs)
+        return client
+
+    monkeypatch.setattr(providers, "_azure_client_factory", factory, raising=False)
+    return client, factory_kwargs
+
+
+def test_foundry_construction_requires_a_base_url(
+    foundry_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+
+    with pytest.raises(providers.DiagnosisError, match="LLM_BASE_URL is not set"):
+        providers.AzureFoundryProvider()
+
+
+def test_foundry_construction_requires_a_key(
+    foundry_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+
+    with pytest.raises(providers.DiagnosisError, match="LLM_API_KEY is not set"):
+        providers.AzureFoundryProvider()
+
+
+def test_foundry_construction_requires_a_model(
+    foundry_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+
+    with pytest.raises(providers.DiagnosisError, match="LLM_MODEL is not set"):
+        providers.AzureFoundryProvider()
+
+
+def test_foundry_missing_settings_are_reported_without_the_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in FOUNDRY_VARS:
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.setattr(runtime_config, name, "", raising=False)
+    monkeypatch.delitem(sys.modules, "openai", raising=False)
+
+    with pytest.raises(providers.DiagnosisError, match="LLM_BASE_URL is not set"):
+        providers.AzureFoundryProvider()
+
+    assert "openai" not in sys.modules
+
+
+def test_foundry_passes_base_url_and_key_to_the_factory(
+    foundry_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, factory_kwargs = _install_fake_foundry(monkeypatch)
+
+    providers.AzureFoundryProvider()
+
+    assert factory_kwargs == {
+        "base_url": FOUNDRY_BASE_URL,
+        "api_key": "test-key",
+    }
+
+
+def test_foundry_sends_the_llm_model_in_the_request(
+    foundry_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, _ = _install_fake_foundry(monkeypatch)
+
+    diagnosis = providers.AzureFoundryProvider().diagnose(CASSETTE_PAYLOAD)
+
+    assert diagnosis == DIAGNOSIS
+    call = client.calls[0]
+    assert call["model"] == FOUNDRY_MODEL
+    assert call["messages"][0]["role"] == "system"
+    assert call["messages"][1] == {
+        "role": "user",
+        "content": _canonical(CASSETTE_PAYLOAD),
+    }
+    assert call["temperature"] == 0
+
+
+def test_foundry_uses_the_azure_names_as_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in FOUNDRY_VARS:
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.setattr(runtime_config, name, "", raising=False)
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://alias.example/openai/v1")
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "alias-key")
+    monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", "alias-model")
+    _, factory_kwargs = _install_fake_foundry(monkeypatch)
+
+    provider = providers.AzureFoundryProvider()
+
+    assert factory_kwargs["base_url"] == "https://alias.example/openai/v1"
+    assert factory_kwargs["api_key"] == "alias-key"
+    assert provider.model == "alias-model"
+
+
+def test_foundry_prefers_llm_names_over_the_aliases(
+    foundry_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://alias.example/openai/v1")
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "alias-key")
+    monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", "alias-model")
+    _, factory_kwargs = _install_fake_foundry(monkeypatch)
+
+    provider = providers.AzureFoundryProvider()
+
+    assert factory_kwargs["base_url"] == FOUNDRY_BASE_URL
+    assert factory_kwargs["api_key"] == "test-key"
+    assert provider.model == FOUNDRY_MODEL
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        json.dumps(DIAGNOSIS),
+        "```json\n" + json.dumps(DIAGNOSIS) + "\n```",
+    ],
+)
+def test_foundry_parses_fenced_and_unfenced_json(
+    foundry_env: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    content: str,
+) -> None:
+    _install_fake_foundry(monkeypatch, content)
+
+    assert providers.AzureFoundryProvider().diagnose(CASSETTE_PAYLOAD) == DIAGNOSIS
+
+
+def test_foundry_rejects_output_that_is_not_a_json_object(
+    foundry_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_fake_foundry(monkeypatch, "[1, 2, 3]")
+
+    with pytest.raises(providers.DiagnosisError, match="not a JSON object"):
+        providers.AzureFoundryProvider().diagnose(CASSETTE_PAYLOAD)
+
+
+def test_foundry_rejects_an_empty_choices_list(
+    foundry_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class EmptyClient:
+        chat = SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **_kwargs: SimpleNamespace(choices=[])
+            )
+        )
+
+    monkeypatch.setattr(
+        providers, "_azure_client_factory", lambda **_kwargs: EmptyClient(), raising=False
+    )
+
+    with pytest.raises(providers.DiagnosisError):
+        providers.AzureFoundryProvider().diagnose(CASSETTE_PAYLOAD)
+
+
+def test_foundry_names_the_exception_when_the_sdk_error_is_silent(
+    foundry_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class SilentSdkError(Exception):
+        pass
+
+    class FailingClient:
+        chat = SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **_kwargs: (_ for _ in ()).throw(SilentSdkError())
+            )
+        )
+
+    monkeypatch.setattr(
+        providers,
+        "_azure_client_factory",
+        lambda **_kwargs: FailingClient(),
+        raising=False,
+    )
+
+    with pytest.raises(providers.DiagnosisError, match="SilentSdkError"):
+        providers.AzureFoundryProvider().diagnose(CASSETTE_PAYLOAD)
+
+
 # --- factory --------------------------------------------------------------
 
 
@@ -286,6 +522,37 @@ def test_factory_selects_each_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     live = providers.build_provider(runtime_config)
     assert isinstance(live, providers.OpenAIProvider)
     assert live.model == "gpt-test"
+
+
+@pytest.mark.parametrize("mode", ["azure", "azure-v1", "foundry"])
+def test_factory_selects_each_foundry_mode(
+    foundry_env: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    _install_fake_foundry(monkeypatch)
+    monkeypatch.setattr(runtime_config, "LLM_PROVIDER", mode)
+    monkeypatch.setattr(runtime_config, "LLM_BASE_URL", FOUNDRY_BASE_URL)
+    monkeypatch.setattr(runtime_config, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(runtime_config, "LLM_MODEL", FOUNDRY_MODEL)
+
+    provider = providers.build_provider(runtime_config)
+
+    assert isinstance(provider, providers.AzureFoundryProvider)
+    assert provider.model == FOUNDRY_MODEL
+
+
+def test_factory_falls_back_to_llm_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runtime_config, "LLM_PROVIDER", "")
+    monkeypatch.setattr(runtime_config, "LLM_MODE", "azure")
+    monkeypatch.setattr(runtime_config, "LLM_BASE_URL", FOUNDRY_BASE_URL)
+    monkeypatch.setattr(runtime_config, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(runtime_config, "LLM_MODEL", FOUNDRY_MODEL)
+    _install_fake_foundry(monkeypatch)
+
+    assert isinstance(
+        providers.build_provider(runtime_config), providers.AzureFoundryProvider
+    )
 
 
 def test_factory_rejects_an_unknown_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -346,6 +613,34 @@ async def test_provenance_carries_mode_model_and_hash(
     assert provenance["prompt_sha256"] == providers.prompt_sha256(expected_payload)
 
 
+async def test_foundry_provenance_records_mode_verbatim_and_model(
+    foundry_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_fake_foundry(monkeypatch)
+    monkeypatch.setattr(runtime_config, "LLM_PROVIDER", "azure-v1")
+    monkeypatch.setattr(runtime_config, "LLM_BASE_URL", FOUNDRY_BASE_URL)
+    monkeypatch.setattr(runtime_config, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(runtime_config, "LLM_MODEL", FOUNDRY_MODEL)
+    monkeypatch.setattr(nodes, "memory", _EmptyMemory())
+    blast = {"affected_nodes": [{"node_id": "edge/api", "distance_hops": 0}]}
+    catalog = {"domain": "chaos_mesh", "fault_type": "pod_kill"}
+    state = _state(blast_radius=blast, catalog_entry=catalog)
+    expected_payload = {
+        "scenario": SCENARIO,
+        "blast_radius": blast,
+        "catalog_entry": catalog,
+        "memory_context": None,
+    }
+
+    result = await nodes.diagnose(state, provider=providers.AzureFoundryProvider())
+
+    assert result["diagnosis"]["diagnosis_provenance"] == {
+        "mode": "azure-v1",
+        "model": FOUNDRY_MODEL,
+        "prompt_sha256": providers.prompt_sha256(expected_payload),
+    }
+
+
 async def test_default_diagnose_honours_cassette_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -384,3 +679,30 @@ def test_app_startup_rejects_an_unknown_llm_mode(
     with pytest.raises(ValueError):
         with TestClient(main.app):
             pass
+
+
+def test_foundry_sends_the_system_prompt(
+    foundry_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The Azure path used to send only the user message, so the model was never
+    # told to answer with JSON. It replied in prose and every diagnosis fell
+    # back to stop_scenario.
+    client, _ = _install_fake_foundry(monkeypatch)
+
+    providers.AzureFoundryProvider().diagnose({"scenario": {"id": "sc-1"}})
+
+    messages = client.calls[0]["messages"]
+    assert messages[0]["role"] == "system"
+    assert "JSON" in messages[0]["content"]
+    assert messages[1]["role"] == "user"
+
+
+def test_prose_wrapping_an_object_is_parsed() -> None:
+    text = 'Here is the diagnosis:\n{"recommended_action": "stop_scenario"}\nDone.'
+
+    assert providers.parse_diagnosis_text(text) == {"recommended_action": "stop_scenario"}
+
+
+def test_prose_without_an_object_names_a_snippet() -> None:
+    with pytest.raises(providers.DiagnosisError, match="I cannot help with that"):
+        providers.parse_diagnosis_text("I cannot help with that request.")

@@ -29,6 +29,12 @@ _SCRATCH = Path(tempfile.mkdtemp(prefix="kubeheal-agent-tests-"))
 os.environ.setdefault("AGENT_DB_PATH", str(_SCRATCH / "memory.db"))
 os.environ.setdefault("AGENT_CHECKPOINT_PATH", str(_SCRATCH / "checkpoints.db"))
 os.environ.setdefault("LLM_MODE", "stub")
+# `.env` at the repo root supplies the live Azure settings; the suite must
+# never select that provider or read a real key, so the names it would use are
+# pinned empty. A test that wants them sets them explicitly.
+os.environ.setdefault("LLM_PROVIDER", "")
+os.environ.setdefault("LLM_BASE_URL", "")
+os.environ.setdefault("LLM_API_KEY", "")
 os.environ.setdefault("GRAPH_URL", "http://graph.test")
 os.environ.setdefault("FAULTLIB_URL", "http://faultlib.test")
 os.environ.setdefault("CHAOS_URL", "http://chaos.test")
@@ -118,6 +124,9 @@ def service_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "memory.db"))
     monkeypatch.setenv("AGENT_CHECKPOINT_PATH", str(tmp_path / "checkpoints.db"))
     monkeypatch.setenv("LLM_MODE", "stub")
+    monkeypatch.setenv("LLM_PROVIDER", "")
+    monkeypatch.setenv("LLM_BASE_URL", "")
+    monkeypatch.setenv("LLM_API_KEY", "")
     monkeypatch.setenv("GRAPH_URL", "http://graph.test")
     monkeypatch.setenv("FAULTLIB_URL", "http://faultlib.test")
     monkeypatch.setenv("CHAOS_URL", "http://chaos.test")

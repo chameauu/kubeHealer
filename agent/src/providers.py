@@ -1,13 +1,21 @@
 """Diagnosis providers behind one seam (CONTRACT D7).
 
-Three implementations, selected by `LLM_MODE`:
+Four implementations, selected by `LLM_PROVIDER` (falling back to
+`LLM_MODE`):
 
 * `StubProvider` — the deterministic fixture, the default in tests and the
   offline demo. It delegates to `graph.stub_diagnosis` so the two cannot drift.
 * `CassetteProvider` — replays an authored or recorded diagnosis keyed by the
   canonical hash of the payload it is given. No network.
-* `OpenAIProvider` — the live path. `openai` is imported inside `__init__`, so
-  this module, the service and every test import without the package.
+* `OpenAIProvider` — the live OpenAI path. `openai` is imported inside
+  `__init__`, so this module, the service and every test import without the
+  package.
+* `AzureFoundryProvider` — the live Azure AI Foundry path, reached through its
+  OpenAI-compatible v1 surface: `base_url` and `api_key`, no `api-version`.
+  It validates `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` before importing
+  `openai` and takes the client from an injectable factory, so
+  missing-credential messages and tests are identical either way. The
+  `AZURE_OPENAI_*` names remain as aliases, never overriding `LLM_*`.
 
 The cassette key is `prompt_sha256(payload)`: the SHA-256 of
 `json.dumps(payload, sort_keys=True, separators=(",", ":"))`. That normalises
@@ -28,22 +36,42 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from config import config as runtime_config
 
 DEFAULT_MODEL = "gpt-4o-mini"
+# `azure` and `foundry` are accepted for the same OpenAI-compatible surface.
+FOUNDRY_MODES = ("azure", "azure-v1", "foundry")
+# (primary LLM_* name, AZURE_OPENAI_* alias)
+FOUNDRY_SETTINGS = (
+    ("LLM_BASE_URL", "AZURE_OPENAI_ENDPOINT"),
+    ("LLM_API_KEY", "AZURE_OPENAI_API_KEY"),
+    ("LLM_MODEL", "AZURE_OPENAI_DEPLOYMENT"),
+)
 SHA256_HEX_LENGTH = 64
 HASH_PREFIX_LENGTH = 12
+
+# Tests and the cassette recorder replace this to avoid the SDK and the network.
+_azure_client_factory: Callable[..., Any] | None = None
 
 SYSTEM_PROMPT = (
     "You are KubeHeal's diagnosis stage. Given a chaos scenario, its blast "
     "radius, the fault catalogue entry and recent incident memory, reply with "
     "one JSON object and nothing else: causal_chain (list of strings), "
     "recommended_action (restart_deployment | stop_scenario | "
-    "scale_deployment), action_target (namespace/name or scenario id), risk "
-    "(low | medium | high) and rationale (one sentence). Use only the three "
-    "listed actions and never invent a field."
+    "scale_deployment), action_target, risk (low | medium | high) and "
+    "rationale (one sentence).\n"
+    "action_target must always be '<namespace>/<deployment>' of the workload "
+    "that carries the fault, for every action. Identify it from the scenario's "
+    "target namespace and label selector; never use the scenario id.\n"
+    "A pod kill is remediated by restart_deployment of that deployment: the "
+    "ReplicaSet has already replaced the pod, and the restart is what clears "
+    "the failed endpoints. Choose stop_scenario only when the fault is an "
+    "injected experiment that cannot be cleared by acting on the workload, and "
+    "scale_deployment only when capacity itself is the problem. Choose the "
+    "action that fixes the cause, not the one that hides it. Use only the "
+    "three listed actions and never invent a field."
 )
 
 
@@ -80,13 +108,32 @@ def _strip_fences(raw: str) -> str:
 def parse_diagnosis_text(raw: Any) -> dict[str, Any]:
     """Parse one model reply; anything but a JSON object raises."""
     text = _strip_fences(raw if isinstance(raw, str) else str(raw))
-    try:
-        parsed = json.loads(text)
-    except Exception as exc:
-        raise DiagnosisError(f"unparseable diagnosis: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise DiagnosisError("diagnosis is not a JSON object")
-    return parsed
+    error: Exception | None = None
+    for candidate in _json_candidates(text):
+        try:
+            parsed = json.loads(candidate)
+        except Exception as exc:
+            error = exc
+            continue
+        if not isinstance(parsed, dict):
+            raise DiagnosisError("diagnosis is not a JSON object")
+        return parsed
+    snippet = " ".join(text.split())[:120]
+    raise DiagnosisError(f"unparseable diagnosis: {error}; reply was {snippet!r}")
+
+
+def _json_candidates(text: str) -> list[str]:
+    """The whole reply, then the first `{`..last `}` slice when one is wrapped.
+
+    A model told to answer with one object still sometimes introduces it with a
+    sentence. Failing the whole diagnosis over that (and then auto-stopping the
+    scenario) is a worse outcome than reading the object it did return.
+    """
+    candidates = [text]
+    start, end = text.find("{"), text.rfind("}")
+    if 0 <= start < end:
+        candidates.append(text[start : end + 1])
+    return candidates
 
 
 class StubProvider:
@@ -180,13 +227,101 @@ class OpenAIProvider:
         return parse_diagnosis_text(output)
 
 
+def selected_mode(config: Any) -> Any:
+    """`LLM_PROVIDER` when set, otherwise the older `LLM_MODE`."""
+    return getattr(config, "LLM_PROVIDER", "") or getattr(config, "LLM_MODE", None)
+
+
+def _foundry_setting(
+    primary: str, alias: str, explicit: str | None = None
+) -> str:
+    """Resolve one setting: explicit, `LLM_*`, alias, config, alias config."""
+    if explicit:
+        return explicit
+    return (
+        os.environ.get(primary)
+        or os.environ.get(alias)
+        or str(getattr(runtime_config, primary, "") or "")
+        or str(getattr(runtime_config, alias, "") or "")
+    )
+
+
+def foundry_missing_settings() -> list[str]:
+    """The required settings that are absent, in validation order."""
+    return [
+        primary
+        for primary, alias in FOUNDRY_SETTINGS
+        if not _foundry_setting(primary, alias)
+    ]
+
+
+class AzureFoundryProvider:
+    """Live Azure Foundry over the OpenAI-compatible v1 surface."""
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        self.base_url = _foundry_setting(
+            "LLM_BASE_URL", "AZURE_OPENAI_ENDPOINT", base_url
+        )
+        self.api_key = _foundry_setting(
+            "LLM_API_KEY", "AZURE_OPENAI_API_KEY", api_key
+        )
+        self.model = _foundry_setting(
+            "LLM_MODEL", "AZURE_OPENAI_DEPLOYMENT", model
+        )
+        if not self.base_url:
+            raise DiagnosisError("LLM_BASE_URL is not set")
+        if not self.api_key:
+            raise DiagnosisError("LLM_API_KEY is not set")
+        if not self.model:
+            raise DiagnosisError("LLM_MODEL is not set")
+        client_kwargs = {"base_url": self.base_url, "api_key": self.api_key}
+        if _azure_client_factory is not None:
+            self._client = _azure_client_factory(**client_kwargs)
+            return
+        try:
+            import openai
+        except ImportError as exc:
+            raise DiagnosisError("the openai package is not installed") from exc
+        self._client = openai.OpenAI(**client_kwargs)
+
+    def diagnose(self, payload: dict[str, Any]) -> dict[str, Any]:
+        content = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        try:
+            completion = self._client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": content},
+                ],
+                temperature=0,
+            )
+            output = completion.choices[0].message.content
+        except Exception as exc:
+            raise DiagnosisError(str(exc) or exc.__class__.__name__) from exc
+        return parse_diagnosis_text(output)
+
+
 def build_provider(config: Any) -> DiagnosisProvider:
-    """Select the provider named by `config.LLM_MODE`; anything else fails."""
-    mode = getattr(config, "LLM_MODE", None)
+    """Select the provider named by `LLM_PROVIDER`/`LLM_MODE`; else fail."""
+    mode = selected_mode(config)
     if mode == "stub":
         return StubProvider()
     if mode == "cassette":
         return CassetteProvider(config.CASSETTE_PATH)
     if mode == "openai":
         return OpenAIProvider(config.LLM_MODEL)
-    raise ValueError(f"unknown LLM_MODE {mode!r}: expected stub, cassette or openai")
+    if mode in FOUNDRY_MODES:
+        return AzureFoundryProvider(
+            base_url=getattr(config, "LLM_BASE_URL", None),
+            api_key=getattr(config, "LLM_API_KEY", None),
+            model=getattr(config, "LLM_MODEL", None),
+        )
+    raise ValueError(
+        f"unknown LLM_PROVIDER {mode!r}: expected stub, cassette, openai, "
+        "azure, azure-v1 or foundry"
+    )

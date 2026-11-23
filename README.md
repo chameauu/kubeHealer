@@ -103,17 +103,22 @@ Unit tests need no cluster, no Chaos Mesh and no API key.
 
 ## Diagnosis providers
 
-`LLM_MODE` selects how the diagnosis is produced:
+`LLM_PROVIDER` (or `LLM_MODE`) selects how the diagnosis is produced:
 
 | mode | what it does |
 |---|---|
 | `stub` (default) | deterministic, no network — the shape is the contract, not the judgement |
 | `cassette` | replays a recorded diagnosis keyed by the SHA-256 of the evidence payload; a miss raises rather than falling back |
-| `openai` | a live call; needs `OPENAI_API_KEY` and the `openai` package |
+| `azure-v1` (also `azure`, `foundry`) | a live call to an Azure AI Foundry deployment over the OpenAI-compatible v1 surface; needs `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` |
+| `openai` | a live call to the OpenAI API; needs `OPENAI_API_KEY` |
+
+`LLM_*` settings are read from the environment, or from a `.env` at the repository root, which is
+gitignored. In a cluster the key belongs in a Secret (`kubeheal-llm`), never in a manifest.
 
 Every run records `diagnosis_provenance` (`mode`, `model`, `prompt_sha256`), so a report can never
-claim a judgement it did not make. The cassette shipped in `agent/fixtures/` is **authored**, and says
-so (`captured_from: authored_fixture`); no live model output is included in this repository.
+claim a judgement it did not make. The unit tests never call a model provider: `conftest.py` clears
+`LLM_PROVIDER`, `LLM_BASE_URL` and `LLM_API_KEY`, so the suite stays on `stub`. The cassette shipped
+in `agent/fixtures/` is **authored**, and says so (`captured_from: authored_fixture`).
 
 ## What is synthetic
 

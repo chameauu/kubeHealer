@@ -13,7 +13,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from config import config, settings
 from events import configure_logging, log_event
 from graph import build_graph, is_pending
-from providers import build_provider
+from providers import build_provider, selected_mode
 from routers import runs as runs_router
 from store import store
 from sweeper import sweep_forever
@@ -24,11 +24,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     configure_logging()
     log_event("service.started", version=settings.version)
 
-    # Fail closed: an unknown LLM_MODE stops the service here, not mid-run.
+    # Fail closed: an unknown LLM_PROVIDER stops the service here, not mid-run.
     provider = build_provider(config)
     log_event(
         "agent.diagnosis_provider",
-        mode=config.LLM_MODE,
+        mode=selected_mode(config),
         model=provider.model,
     )
 

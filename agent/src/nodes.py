@@ -230,7 +230,7 @@ async def diagnose(
     except Exception as exc:
         failure = f"provider error: {exc}"
     provenance = {
-        "mode": config.LLM_MODE,
+        "mode": providers.selected_mode(config),
         "model": model,
         "prompt_sha256": providers.prompt_sha256(payload),
     }

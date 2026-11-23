@@ -7,8 +7,46 @@ without rebuilding the app.
 """
 
 import os
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+ENV_PATH = REPO_ROOT / ".env"
+
+
+def _load_dotenv(path: Path) -> None:
+    """Best-effort `.env` defaults: existing environment variables always win.
+
+    No dependency and no failure on a missing or malformed file. A value may be
+    quoted; an unquoted value loses a trailing ` # comment`. Nothing is logged,
+    because the file holds a key.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if value[:1] in ("'", '"'):
+            closing = value.find(value[0], 1)
+            value = value[1:closing] if closing != -1 else value[1:]
+        elif " #" in value:
+            value = value.split(" #", 1)[0].rstrip()
+        if name:
+            os.environ.setdefault(name, value)
+
+
+_load_dotenv(ENV_PATH)
 
 
 class Settings(BaseSettings):
@@ -32,9 +70,19 @@ class RuntimeConfig:
         self.FAULTLIB_URL: str = os.environ.get("FAULTLIB_URL", "http://faultlib:8081")
         self.CHAOS_URL: str = os.environ.get("CHAOS_URL", "http://chaos:8082")
         self.LLM_MODE: str = os.environ.get("LLM_MODE", "stub")
+        self.LLM_PROVIDER: str = os.environ.get("LLM_PROVIDER", "")
         self.LLM_MODEL: str = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+        self.LLM_BASE_URL: str = os.environ.get("LLM_BASE_URL", "")
+        self.LLM_API_KEY: str = os.environ.get("LLM_API_KEY", "")
         self.CASSETTE_PATH: str = os.environ.get(
             "AGENT_CASSETTE_PATH", "fixtures/diagnosis-cassette.json"
+        )
+        # Legacy aliases for the OpenAI-compatible v1 surface; the LLM_* names
+        # above win whenever both are present.
+        self.AZURE_OPENAI_ENDPOINT: str = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+        self.AZURE_OPENAI_API_KEY: str = os.environ.get("AZURE_OPENAI_API_KEY", "")
+        self.AZURE_OPENAI_DEPLOYMENT: str = os.environ.get(
+            "AZURE_OPENAI_DEPLOYMENT", ""
         )
         self.APPROVAL_TIMEOUT_SECONDS: int = int(
             os.environ.get("APPROVAL_TIMEOUT_SECONDS", "300")
