@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 import nodes
+import providers
 from state import new_state
 
 SCENARIO = {
@@ -145,6 +146,227 @@ async def test_diagnose_forwards_blast_radius_to_the_provider(
 
     assert seen["blast_radius"] == blast
     assert seen["blast_radius"]["affected_nodes"]
+
+
+MEMORY_INCIDENT_KEYS = {
+    "scenario_id",
+    "fault_type",
+    "outcome",
+    "risk",
+    "approval_status",
+    "mttr_seconds",
+}
+
+
+def _incident(index: int, **overrides: Any) -> dict[str, Any]:
+    """One stored incident, as `report` writes it: the scenario document included."""
+    incident = {
+        "scenario_id": f"sc-{index}",
+        "scenario": dict(SCENARIO),
+        "fault_type": "pod_kill",
+        "outcome": "success",
+        "risk": "high",
+        "approval_status": "approved",
+        "mttr_seconds": 60.0 + index,
+        "status": "done",
+        "started_at": "2026-11-22T12:00:00+00:00",
+        "ended_at": "2026-11-22T12:01:00+00:00",
+    }
+    incident.update(overrides)
+    return incident
+
+
+class _FakeMemory:
+    """The `recall` seam only; `record` belongs to `report`."""
+
+    def __init__(
+        self,
+        incidents: list[dict[str, Any]] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.incidents = incidents or []
+        self.error = error
+        self.calls: list[str] = []
+
+    async def recall(self, fault_type: str, limit: int = 20) -> dict[str, Any]:
+        self.calls.append(fault_type)
+        if self.error is not None:
+            raise self.error
+        return {
+            "incidents": list(self.incidents),
+            "success_rate": 0.5,
+            "confidence": 50,
+            "mean_mttr_seconds": 61.0,
+        }
+
+
+@pytest.fixture(autouse=True)
+def _empty_memory(monkeypatch: Any) -> _FakeMemory:
+    """Diagnose tests must not read the session-wide incident DB.
+
+    Without this, `memory_context` depends on which earlier test file recorded
+    a run. Tests that need incidents replace the fake through monkeypatch.
+    """
+    fake = _FakeMemory()
+    monkeypatch.setattr(nodes, "memory", fake)
+    return fake
+
+
+async def test_diagnose_feeds_bounded_memory_into_the_provider_payload(
+    monkeypatch: Any,
+) -> None:
+    incidents = [
+        _incident(1),
+        _incident(
+            2,
+            outcome="failed",
+            risk="medium",
+            approval_status="rejected",
+            mttr_seconds=None,
+        ),
+    ]
+    monkeypatch.setattr(nodes, "memory", _FakeMemory(incidents))
+    seen: dict[str, Any] = {}
+
+    def provider(**kwargs: Any) -> str:
+        seen.update(kwargs)
+        return json.dumps(DIAGNOSIS)
+
+    monkeypatch.setattr(nodes, "diagnosis_provider", provider)
+
+    result = await nodes.diagnose(_state())
+
+    context = {
+        "incidents": [
+            {
+                "scenario_id": "sc-1",
+                "fault_type": "pod_kill",
+                "outcome": "success",
+                "risk": "high",
+                "approval_status": "approved",
+                "mttr_seconds": 61.0,
+            },
+            {
+                "scenario_id": "sc-2",
+                "fault_type": "pod_kill",
+                "outcome": "failed",
+                "risk": "medium",
+                "approval_status": "rejected",
+                "mttr_seconds": None,
+            },
+        ],
+        "success_rate": 0.5,
+        "confidence": 50,
+        "mean_mttr_seconds": 61.0,
+    }
+    assert result["memory_context"] == context
+    assert seen["memory_context"] == context
+    assert "scenario" not in seen["memory_context"]["incidents"][0]
+    assert "target" not in seen["memory_context"]["incidents"][0]
+
+
+async def test_memory_summaries_are_capped_and_key_whitelisted(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(
+        nodes, "memory", _FakeMemory([_incident(index) for index in range(25)])
+    )
+    monkeypatch.setattr(
+        nodes, "diagnosis_provider", lambda **_kwargs: json.dumps(DIAGNOSIS)
+    )
+
+    result = await nodes.diagnose(_state())
+
+    summaries = result["memory_context"]["incidents"]
+    assert len(summaries) == 20
+    assert all(set(summary) == MEMORY_INCIDENT_KEYS for summary in summaries)
+    assert summaries[0]["scenario_id"] == "sc-0"
+    assert summaries[-1]["scenario_id"] == "sc-19"
+
+
+async def test_empty_memory_keeps_the_prompt_hash_unchanged(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+
+    def provider(**kwargs: Any) -> str:
+        captured.update(kwargs)
+        return json.dumps(DIAGNOSIS)
+
+    monkeypatch.setattr(nodes, "diagnosis_provider", provider)
+    state = _state(
+        blast_radius={"affected_nodes": []},
+        catalog_entry={"domain": "chaos_mesh", "fault_type": "pod_kill"},
+    )
+
+    result = await nodes.diagnose(state)
+
+    before = {
+        "scenario": state["scenario"],
+        "blast_radius": {"affected_nodes": []},
+        "catalog_entry": {"domain": "chaos_mesh", "fault_type": "pod_kill"},
+        "memory_context": None,
+    }
+    assert result["memory_context"] is None
+    assert captured == before
+    provenance = result["diagnosis"]["diagnosis_provenance"]
+    assert providers.prompt_sha256(before) == provenance["prompt_sha256"]
+    assert providers.prompt_sha256(captured) == provenance["prompt_sha256"]
+
+
+async def _hash_with(monkeypatch: Any, incidents: list[dict[str, Any]]) -> str:
+    monkeypatch.setattr(nodes, "memory", _FakeMemory(incidents))
+    monkeypatch.setattr(
+        nodes, "diagnosis_provider", lambda **_kwargs: json.dumps(DIAGNOSIS)
+    )
+    result = await nodes.diagnose(_state())
+    return result["diagnosis"]["diagnosis_provenance"]["prompt_sha256"]
+
+
+async def test_incident_memory_changes_the_prompt_hash(monkeypatch: Any) -> None:
+    # The hash is what a cassette keys on: memory that never moved the hash
+    # never reached the payload either.
+    empty = await _hash_with(monkeypatch, [])
+    with_memory = await _hash_with(monkeypatch, [_incident(1)])
+
+    assert empty != with_memory
+
+
+async def test_recall_failure_is_logged_once_and_does_not_fail_the_run(
+    monkeypatch: Any,
+) -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        nodes, "log_event", lambda event, **fields: events.append((event, fields))
+    )
+    monkeypatch.setattr(
+        nodes, "memory", _FakeMemory(error=RuntimeError("memory is down"))
+    )
+    monkeypatch.setattr(
+        nodes, "diagnosis_provider", lambda **_kwargs: json.dumps(DIAGNOSIS)
+    )
+
+    result = await nodes.diagnose(_state())
+
+    assert result["memory_context"] is None
+    assert result["diagnosis"]["recommended_action"] == "restart_deployment"
+    unavailable = [
+        fields for event, fields in events if event == "agent.memory.unavailable"
+    ]
+    assert len(unavailable) == 1
+    assert "memory is down" in unavailable[0]["error"]
+
+
+async def test_scenario_without_a_fault_type_never_recalls(monkeypatch: Any) -> None:
+    fake = _FakeMemory([_incident(1)])
+    monkeypatch.setattr(nodes, "memory", fake)
+    monkeypatch.setattr(
+        nodes, "diagnosis_provider", lambda **_kwargs: json.dumps(DIAGNOSIS)
+    )
+    scenario = {key: value for key, value in SCENARIO.items() if key != "fault_type"}
+
+    result = await nodes.diagnose(_state(scenario=scenario))
+
+    assert fake.calls == []
+    assert result["memory_context"] is None
 
 
 async def test_heal_plan_requires_approval_for_high_and_medium(

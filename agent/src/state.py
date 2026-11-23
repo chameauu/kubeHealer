@@ -20,7 +20,7 @@ class AgentState(TypedDict):
     scenario: dict[str, Any]
     blast_radius: dict[str, Any] | None
     catalog_entry: dict[str, Any] | None
-    memory_context: str | None
+    memory_context: dict[str, Any] | None
     diagnosis: dict[str, Any] | None
     risk: str | None  # effective risk, decided by `policy`, not by the diagnosis
     risk_policy: dict[str, Any] | None  # proposed vs minimum vs effective, and why

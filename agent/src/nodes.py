@@ -19,7 +19,7 @@ import providers
 import policy
 from config import config
 from events import log_event
-from memory import memory
+from memory import MAX_INCIDENTS, memory
 from state import AgentState, utcnow
 from store import store
 from tools import (
@@ -38,6 +38,18 @@ ALLOWED_ACTIONS = frozenset({"restart_deployment", "stop_scenario", "scale_deplo
 POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_DOMAIN = "chaos_mesh"
 
+# The only fields memory may contribute to a prompt. The stored incident is a
+# whole report, scenario document included; the prompt gets the projection and
+# nothing else, so the payload stays small and the cassette hash stays stable.
+MEMORY_INCIDENT_KEYS = (
+    "scenario_id",
+    "fault_type",
+    "outcome",
+    "risk",
+    "approval_status",
+    "mttr_seconds",
+)
+
 
 def _default_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -52,13 +64,15 @@ def _default_provider(**_context: Any) -> Any:
     return providers.build_provider(config).diagnose(_context)
 
 
-def _diagnosis_payload(state: AgentState) -> dict[str, Any]:
+def _diagnosis_payload(
+    state: AgentState, memory_context: dict[str, Any] | None
+) -> dict[str, Any]:
     """The canonical payload: every key always present, values as stored."""
     return {
         "scenario": state.get("scenario"),
         "blast_radius": state.get("blast_radius"),
         "catalog_entry": state.get("catalog_entry"),
-        "memory_context": state.get("memory_context"),
+        "memory_context": memory_context,
     }
 
 
@@ -164,11 +178,47 @@ def _fallback_diagnosis(
     }
 
 
+def _bounded_memory(result: dict[str, Any]) -> dict[str, Any] | None:
+    """Reduce one memory lookup to what a prompt may carry, or `None` if empty.
+
+    Each incident keeps the six `MEMORY_INCIDENT_KEYS`, the list keeps at most
+    `MAX_INCIDENTS`, and the aggregates travel beside it. The answer is `None`
+    rather than `{}` when memory is empty, so a first run hashes exactly as it
+    did before incident memory reached the diagnosis.
+    """
+    if not isinstance(result, dict):
+        return None
+    raw = result.get("incidents")
+    if not isinstance(raw, list):
+        return None
+    summaries = [
+        {key: incident.get(key) for key in MEMORY_INCIDENT_KEYS}
+        for incident in raw[:MAX_INCIDENTS]
+        if isinstance(incident, dict)
+    ]
+    if not summaries:
+        return None
+    return {
+        "incidents": summaries,
+        "success_rate": result.get("success_rate"),
+        "confidence": result.get("confidence"),
+        "mean_mttr_seconds": result.get("mean_mttr_seconds"),
+    }
+
+
 async def diagnose(
     state: AgentState, *, provider: Callable[..., Any] | None = None
 ) -> dict[str, Any]:
     """Ask the provider for strict JSON; unparseable output fails closed."""
-    payload = _diagnosis_payload(state)
+    fault_type = (state.get("scenario") or {}).get("fault_type")
+    memory_context: dict[str, Any] | None = None
+    if fault_type:
+        try:
+            memory_context = _bounded_memory(await memory.recall(str(fault_type)))
+        except Exception as exc:
+            # Memory is context: a broken store must not fail the diagnosis.
+            log_event("agent.memory.unavailable", error=str(exc))
+    payload = _diagnosis_payload(state, memory_context)
     raw: Any = None
     failure: str | None = None
     model: str | None = None
@@ -194,7 +244,12 @@ async def diagnose(
     else:
         diagnosis = parsed
         diagnosis["diagnosis_provenance"] = provenance
-    return {"node": "diagnose", "diagnosis": diagnosis, "updated_at": utcnow()}
+    return {
+        "node": "diagnose",
+        "memory_context": memory_context,
+        "diagnosis": diagnosis,
+        "updated_at": utcnow(),
+    }
 
 
 async def heal_plan(state: AgentState) -> dict[str, Any]:

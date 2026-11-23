@@ -300,6 +300,18 @@ def test_factory_rejects_an_unknown_mode(monkeypatch: pytest.MonkeyPatch) -> Non
 # --- wiring and provenance ------------------------------------------------
 
 
+class _EmptyMemory:
+    """An empty incident store: the payloads below predate incident memory."""
+
+    async def recall(self, fault_type: str, limit: int = 20) -> dict[str, Any]:
+        return {
+            "incidents": [],
+            "success_rate": 0.0,
+            "confidence": 0,
+            "mean_mttr_seconds": None,
+        }
+
+
 async def test_provenance_carries_mode_model_and_hash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -312,6 +324,9 @@ async def test_provenance_carries_mode_model_and_hash(
             calls.append(payload)
             return dict(DIAGNOSIS)
 
+    # `diagnose` now reads incident memory, which the session-wide DB shares
+    # between test files; these assertions are about the payload contract.
+    monkeypatch.setattr(nodes, "memory", _EmptyMemory())
     blast = {"affected_nodes": [{"node_id": "edge/api", "distance_hops": 0}]}
     catalog = {"domain": "chaos_mesh", "fault_type": "pod_kill"}
     state = _state(blast_radius=blast, catalog_entry=catalog)
@@ -338,6 +353,9 @@ async def test_default_diagnose_honours_cassette_mode(
     payload = document["demo_payload"]
     monkeypatch.setattr(runtime_config, "LLM_MODE", "cassette")
     monkeypatch.setattr(runtime_config, "CASSETTE_PATH", str(DEMO_CASSETTE))
+    # The cassette was authored with `memory_context: null`, and a cassette
+    # replays only on an identical payload: pin the empty store it assumed.
+    monkeypatch.setattr(nodes, "memory", _EmptyMemory())
 
     state = new_state(str(payload["scenario"]["id"]), payload["scenario"])
     state["blast_radius"] = payload["blast_radius"]
