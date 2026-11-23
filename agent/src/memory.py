@@ -4,6 +4,12 @@
 newest first. `aborted` is not a success but is not an action failure either:
 it is excluded from the confidence denominator and from the success rate, and
 mean MTTR is averaged over successful runs only.
+
+`by_action` is the per-action projection of the same bounded incident set: one
+bucket per action the incidents name, so a model can tell an action that works
+from one that does not. An `aborted` incident that names an action counts as an
+attempt with no success — the action was selected, never validated — while
+leaving `success_rate` and `confidence` untouched.
 """
 
 from __future__ import annotations
@@ -47,6 +53,49 @@ def _outcome(run: dict[str, Any]) -> str:
     if run.get("status") == "aborted":
         return "aborted"
     return "failed"
+
+
+def _action(run: dict[str, Any]) -> str | None:
+    """The action the incident records, or `None` when it recorded none."""
+    action = run.get("action")
+    if isinstance(action, str) and action:
+        return action
+    return None
+
+
+def _by_action(incidents: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Per-action attempts, successes and mean MTTR over successes only.
+
+    Only incidents that name an action are counted. `aborted` is included when
+    it names one (an attempt that never reached a verdict) and never counted as
+    a success. Every action present appears, sorted by name.
+    """
+    buckets: dict[str, dict[str, Any]] = {}
+    for incident in incidents:
+        action = _action(incident)
+        if action is None:
+            continue
+        bucket = buckets.setdefault(
+            action, {"attempts": 0, "successes": 0, "mttrs": []}
+        )
+        bucket["attempts"] += 1
+        if _outcome(incident) != "success":
+            continue
+        bucket["successes"] += 1
+        if incident.get("mttr_seconds") is not None:
+            bucket["mttrs"].append(float(incident["mttr_seconds"]))
+    return {
+        action: {
+            "attempts": bucket["attempts"],
+            "successes": bucket["successes"],
+            "mean_mttr_seconds": (
+                sum(bucket["mttrs"]) / len(bucket["mttrs"])
+                if bucket["mttrs"]
+                else None
+            ),
+        }
+        for action, bucket in sorted(buckets.items())
+    }
 
 
 class IncidentMemory:
@@ -115,6 +164,7 @@ class IncidentMemory:
             "success_rate": success_rate,
             "confidence": confidence,
             "mean_mttr_seconds": (sum(mttrs) / len(mttrs)) if mttrs else None,
+            "by_action": _by_action(incidents),
         }
 
     async def close(self) -> None:

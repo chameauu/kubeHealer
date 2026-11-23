@@ -52,6 +52,7 @@ MEMORY_INCIDENT_KEYS = (
     "risk",
     "approval_status",
     "mttr_seconds",
+    "action",
 )
 
 
@@ -185,10 +186,12 @@ def _fallback_diagnosis(
 def _bounded_memory(result: dict[str, Any]) -> dict[str, Any] | None:
     """Reduce one memory lookup to what a prompt may carry, or `None` if empty.
 
-    Each incident keeps the six `MEMORY_INCIDENT_KEYS`, the list keeps at most
-    `MAX_INCIDENTS`, and the aggregates travel beside it. The answer is `None`
-    rather than `{}` when memory is empty, so a first run hashes exactly as it
-    did before incident memory reached the diagnosis.
+    Each incident keeps the `MEMORY_INCIDENT_KEYS` (the action it recorded
+    included), the list keeps at most `MAX_INCIDENTS`, and the aggregates travel
+    beside it. `by_action` is the store's own per-action view of that same
+    bounded incident set, passed through unchanged; there is no second cap. The
+    answer is `None` rather than `{}` when memory is empty, so a first run
+    hashes exactly as it did before incident memory reached the diagnosis.
     """
     if not isinstance(result, dict):
         return None
@@ -202,11 +205,13 @@ def _bounded_memory(result: dict[str, Any]) -> dict[str, Any] | None:
     ]
     if not summaries:
         return None
+    by_action = result.get("by_action")
     return {
         "incidents": summaries,
         "success_rate": result.get("success_rate"),
         "confidence": result.get("confidence"),
         "mean_mttr_seconds": result.get("mean_mttr_seconds"),
+        "by_action": by_action if isinstance(by_action, dict) else {},
     }
 
 
@@ -535,6 +540,16 @@ async def report(state: AgentState) -> dict[str, Any]:
     status = "done" if success else "error"
     mttr = state.get("mttr_seconds") if success else None
     scenario = state.get("scenario") or {}
+    diagnosis = state.get("diagnosis") or {}
+    proposed_action = diagnosis.get("recommended_action")
+    # Record which action ran, not just what it did. Only the diagnosis can
+    # name it: no diagnosis means `None`, never a string guessed from
+    # `action_result`, and never a default action.
+    action = (
+        proposed_action
+        if isinstance(proposed_action, str) and proposed_action
+        else None
+    )
     timestamp = now().isoformat()
 
     document: dict[str, Any] = {
@@ -548,6 +563,7 @@ async def report(state: AgentState) -> dict[str, Any]:
         "risk": state.get("risk"),
         "risk_policy": state.get("risk_policy"),
         "verify_result": state.get("verify_result"),
+        "action": action,
         "action_result": state.get("action_result"),
         "mttr_seconds": mttr,
         "started_at": state.get("started_at"),

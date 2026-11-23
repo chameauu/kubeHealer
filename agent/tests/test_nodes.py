@@ -155,6 +155,7 @@ MEMORY_INCIDENT_KEYS = {
     "risk",
     "approval_status",
     "mttr_seconds",
+    "action",
 }
 
 
@@ -168,6 +169,7 @@ def _incident(index: int, **overrides: Any) -> dict[str, Any]:
         "risk": "high",
         "approval_status": "approved",
         "mttr_seconds": 60.0 + index,
+        "action": "restart_deployment",
         "status": "done",
         "started_at": "2026-11-22T12:00:00+00:00",
         "ended_at": "2026-11-22T12:01:00+00:00",
@@ -183,9 +185,11 @@ class _FakeMemory:
         self,
         incidents: list[dict[str, Any]] | None = None,
         error: Exception | None = None,
+        by_action: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.incidents = incidents or []
         self.error = error
+        self.by_action = by_action or {}
         self.calls: list[str] = []
 
     async def recall(self, fault_type: str, limit: int = 20) -> dict[str, Any]:
@@ -197,6 +201,7 @@ class _FakeMemory:
             "success_rate": 0.5,
             "confidence": 50,
             "mean_mttr_seconds": 61.0,
+            "by_action": dict(self.by_action),
         }
 
 
@@ -223,6 +228,7 @@ async def test_diagnose_feeds_bounded_memory_into_the_provider_payload(
             risk="medium",
             approval_status="rejected",
             mttr_seconds=None,
+            action="stop_scenario",
         ),
     ]
     monkeypatch.setattr(nodes, "memory", _FakeMemory(incidents))
@@ -236,6 +242,9 @@ async def test_diagnose_feeds_bounded_memory_into_the_provider_payload(
 
     result = await nodes.diagnose(_state())
 
+    # Adapted for F8: the projection gained `action` per incident and the
+    # aggregate gained `by_action`; both are part of the evidence now, so the
+    # exact payload shape changed. No assertion below was weakened.
     context = {
         "incidents": [
             {
@@ -245,6 +254,7 @@ async def test_diagnose_feeds_bounded_memory_into_the_provider_payload(
                 "risk": "high",
                 "approval_status": "approved",
                 "mttr_seconds": 61.0,
+                "action": "restart_deployment",
             },
             {
                 "scenario_id": "sc-2",
@@ -253,11 +263,13 @@ async def test_diagnose_feeds_bounded_memory_into_the_provider_payload(
                 "risk": "medium",
                 "approval_status": "rejected",
                 "mttr_seconds": None,
+                "action": "stop_scenario",
             },
         ],
         "success_rate": 0.5,
         "confidence": 50,
         "mean_mttr_seconds": 61.0,
+        "by_action": {},
     }
     assert result["memory_context"] == context
     assert seen["memory_context"] == context
@@ -312,8 +324,12 @@ async def test_empty_memory_keeps_the_prompt_hash_unchanged(monkeypatch: Any) ->
     assert providers.prompt_sha256(captured) == provenance["prompt_sha256"]
 
 
-async def _hash_with(monkeypatch: Any, incidents: list[dict[str, Any]]) -> str:
-    monkeypatch.setattr(nodes, "memory", _FakeMemory(incidents))
+async def _hash_with(
+    monkeypatch: Any,
+    incidents: list[dict[str, Any]],
+    by_action: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    monkeypatch.setattr(nodes, "memory", _FakeMemory(incidents, by_action=by_action))
     monkeypatch.setattr(
         nodes, "diagnosis_provider", lambda **_kwargs: json.dumps(DIAGNOSIS)
     )
@@ -328,6 +344,114 @@ async def test_incident_memory_changes_the_prompt_hash(monkeypatch: Any) -> None
     with_memory = await _hash_with(monkeypatch, [_incident(1)])
 
     assert empty != with_memory
+
+
+async def test_by_action_alone_changes_the_prompt_hash(monkeypatch: Any) -> None:
+    # `by_action` is evidence, not decoration: two runs whose incidents match
+    # but whose per-action record differs must not share a cassette key.
+    incidents = [_incident(1)]
+    one_success = await _hash_with(
+        monkeypatch,
+        incidents,
+        by_action={
+            "restart_deployment": {
+                "attempts": 1,
+                "successes": 1,
+                "mean_mttr_seconds": 61.0,
+            }
+        },
+    )
+    no_success = await _hash_with(
+        monkeypatch,
+        incidents,
+        by_action={
+            "restart_deployment": {
+                "attempts": 1,
+                "successes": 0,
+                "mean_mttr_seconds": None,
+            }
+        },
+    )
+
+    assert one_success != no_success
+
+
+async def test_diagnose_payload_carries_by_action_and_incident_actions(
+    monkeypatch: Any,
+) -> None:
+    by_action = {
+        "restart_deployment": {
+            "attempts": 3,
+            "successes": 2,
+            "mean_mttr_seconds": 20.0,
+        },
+        "scale_deployment": {
+            "attempts": 1,
+            "successes": 0,
+            "mean_mttr_seconds": None,
+        },
+    }
+    incidents = [
+        _incident(1, action="restart_deployment"),
+        _incident(
+            2,
+            outcome="failed",
+            mttr_seconds=None,
+            action="scale_deployment",
+        ),
+    ]
+    monkeypatch.setattr(
+        nodes, "memory", _FakeMemory(incidents, by_action=by_action)
+    )
+    seen: dict[str, Any] = {}
+
+    def provider(**kwargs: Any) -> str:
+        seen.update(kwargs)
+        return json.dumps(DIAGNOSIS)
+
+    monkeypatch.setattr(nodes, "diagnosis_provider", provider)
+
+    result = await nodes.diagnose(_state())
+
+    assert seen["memory_context"]["by_action"] == by_action
+    assert [summary["action"] for summary in seen["memory_context"]["incidents"]] == [
+        "restart_deployment",
+        "scale_deployment",
+    ]
+    # The stored context and the payload agree, so the evidence that reached
+    # the model is the evidence the run records.
+    assert result["memory_context"]["by_action"] == by_action
+
+
+async def test_diagnose_with_memory_parses_through_the_stub_provider(
+    monkeypatch: Any,
+) -> None:
+    # No provider seam here: the configured `stub` provider must accept the
+    # enlarged payload, `by_action` included, and still return a diagnosis.
+    monkeypatch.setattr(
+        nodes,
+        "memory",
+        _FakeMemory(
+            [_incident(1)],
+            by_action={
+                "restart_deployment": {
+                    "attempts": 1,
+                    "successes": 1,
+                    "mean_mttr_seconds": 61.0,
+                }
+            },
+        ),
+    )
+
+    result = await nodes.diagnose(_state())
+
+    diagnosis = result["diagnosis"]
+    assert diagnosis["recommended_action"] == "restart_deployment"
+    assert diagnosis["diagnosis_provenance"]["mode"] == "stub"
+    assert "parse_error" not in diagnosis
+    assert result["memory_context"]["incidents"][0]["action"] == (
+        "restart_deployment"
+    )
 
 
 async def test_recall_failure_is_logged_once_and_does_not_fail_the_run(
@@ -1048,6 +1172,68 @@ async def test_report_writes_memory_and_closes_the_run_done(monkeypatch: Any) ->
     assert recorded and recorded[0]["outcome"] == "success"
     assert store.saved and store.saved[-1]["status"] == "done"
     assert result.get("status") == "done"
+
+
+def _report_seams(monkeypatch: Any) -> list[dict[str, Any]]:
+    """Record what `report` writes without a database; return the memory rows."""
+    recorded: list[dict[str, Any]] = []
+
+    class FakeMemory:
+        async def record(self, run: dict[str, Any]) -> None:
+            recorded.append(run)
+
+    class FakeStore:
+        async def save(self, run: dict[str, Any]) -> None:
+            pass
+
+    monkeypatch.setattr(nodes, "memory", FakeMemory())
+    monkeypatch.setattr(nodes, "store", FakeStore())
+    return recorded
+
+
+async def test_report_records_the_action_the_diagnosis_recommended(
+    monkeypatch: Any,
+) -> None:
+    recorded = _report_seams(monkeypatch)
+    state = _state(
+        node="verify",
+        diagnosis={**DIAGNOSIS, "recommended_action": "scale_deployment"},
+        approval_status="approved",
+        risk="high",
+        verify_result="recovered",
+        mttr_seconds=100.0,
+        action_result="scaled deployment edge/api to 3",
+    )
+
+    await nodes.report(state)
+
+    row = recorded[0]
+    assert row["action"] == "scale_deployment"
+    # The existing fields are still written beside it.
+    assert row["action_result"] == "scaled deployment edge/api to 3"
+    assert row["outcome"] == "success"
+    assert row["risk"] == "high"
+    assert row["mttr_seconds"] == 100.0
+
+
+async def test_report_records_no_action_when_the_diagnosis_has_none(
+    monkeypatch: Any,
+) -> None:
+    # Never a guessed string, and never inferred from what `action_result`
+    # says happened: no diagnosis means no recorded action.
+    recorded = _report_seams(monkeypatch)
+    state = _state(
+        node="verify",
+        approval_status="approved",
+        verify_result="recovered",
+        mttr_seconds=100.0,
+        action_result="restarted deployment edge/api",
+    )
+
+    await nodes.report(state)
+
+    assert recorded[0]["action"] is None
+    assert recorded[0]["action_result"] == "restarted deployment edge/api"
 
 
 # The two stop-at-the-deadline tests that lived here were removed by decision:
